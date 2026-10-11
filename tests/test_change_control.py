@@ -3,6 +3,7 @@ approvals, access levels and the kill switch from a notification."""
 import base64
 import hashlib
 import json
+import re
 import os
 import sys
 import time
@@ -157,7 +158,7 @@ def test_snapshot_wanted_for_held_and_named_actions(c, rules):
                json={"kind": "data", "summary": "contacts before", "data": {"rows": [{"email": "a@b.co"}]}})
     assert r.status_code == 200 and r.json()["kind"] == "data"
     snaps = c.get(f"/v1/events/{named['event_id']}/snapshots", headers=BOSS).json()["snapshots"]
-    assert snaps[0]["data"]["rows"][0]["email"].endswith("@b.co") and "a@" not in snaps[0]["data"]["rows"][0]["email"]
+    assert re.fullmatch(r"a.redacted-[0-9a-f]{6}@b.co", snaps[0]["data"]["rows"][0]["email"])
     ev = c.get(f"/v1/events/{named['event_id']}", headers=BOSS).json()
     assert ev["snapshot"]["summary"] == "contacts before"
 
