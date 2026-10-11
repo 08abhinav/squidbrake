@@ -61,7 +61,8 @@ prompts, the audit trail) never leaves it; usage counts go out only if you say y
 - **Judges by history:** blocks a retry of something a person rejected, catches look-alike domains
   (`acrne-corp.com` pretending to be `acme.com`), flags duplicate refunds, and lets you write sequence rules
   ("deleting a database right after its backups were turned off") that say which earlier step caused them.
-- **Fails closed:** if Squidbrake is down, guarded tools don't run.
+- **Fails closed, rule by rule:** if Squidbrake is down, guarded tools don't run, unless a rule says
+  `when_unreachable: allow` for its actions (agents keep a copy of those answers).
 
 See [SHOWCASE.md](SHOWCASE.md) for a 5-minute demo with a sandbox company, and [incidents/](incidents/) for **10 real
 AI-agent incidents replayed against the shipped rules** (Replit, the Railway volume deletion, GitHub MCP, Supabase
@@ -418,6 +419,31 @@ Rules with `action: review` hold the call until a person approves or rejects it:
 - Through the HTTP proxy, a held request stays open until it's decided, so the caller's HTTP
   timeout must be longer than the rule's `timeout_seconds`.
 
+## Undo copies, spend limits, proof of work and signed approvals
+
+- **Undo copies (`snapshots:` in rules.yaml, default `required`).** Before an action that waits for a person, or a
+  command that can't be undone, runs, Squidbrake keeps a copy of what it changes: files and git changes on the agent's
+  computer (`squidbrake undo`; Claude Code's Write and Edit too), the record behind an API call through `/proxy` (read
+  with a GET first), or what your `client.py` snapshot function returns
+  (`@gw.guard(snapshot=lambda args: db.get_order(args["order_id"]))`). If a copy is required and can't be made, the
+  action doesn't run. A rule can set `snapshot: required | best_effort | off`; `required` on a rule also blocks paths
+  that can't make a copy (MCP tools). The dashboard shows each copy and how to restore it.
+- **Kill switch.** *Stop agents* in the dashboard or on the phone page stops one agent, one conversation or all of them.
+  Phone notifications also carry a **Stop agent** button, and the one-tap approval page a *Stop* button.
+- **Spend limits (`budgets:`).** Pause an agent once it has used N model tokens (or `usd:`) in a day or month, each on
+  its own or several together. Claude Code's hook reports its tokens from the transcript; other agents send them to
+  `POST /v1/usage` (`gw.usage(...)`). Reports shows each limit and what's used.
+- **Proof of work (`proof_checks:`).** When an agent says an action is done, Squidbrake looks in the real system (Stripe,
+  GitHub, a SQL database, or any HTTP API) with read-only credentials from the gateway's environment, and records
+  *confirmed* or *not actually done*; a mismatch notifies a person.
+- **Approvals signed by Face ID or fingerprint.** Register a phone or laptop as a passkey (Settings, or the phone page).
+  Each approval made with it is signed by the device over exactly that decision and kept in the audit trail. Settings
+  can require it for every approval (rejecting never needs it).
+- **Access levels.** Owner, admin, approver and viewer. Viewers see everything and change nothing; only owners make
+  admins and owners, and a team always keeps one owner. Teams such as `finance` still work for `approvers: [role:finance]`.
+- **AI approval briefs.** Off until an admin adds the team's own Anthropic key: a short, plain-English risk note on each
+  held action, written from what the dashboard shows (redacted). Advice only.
+
 ## Dashboard
 
 Open `http://<host>:8080/dashboard` and paste your admin key (or any key made with `add-key`). It is stored
@@ -438,7 +464,11 @@ Claude Code's built-in permissions control actions for an individual agent. Squi
 
 ### What happens if Squidbrake is down?
 
-Squidbrake **fails closed**. Guarded tool calls are blocked if the gateway is unreachable, rather than being allowed through.
+Squidbrake **fails closed**. Guarded tool calls are blocked if the gateway is unreachable, rather than being allowed
+through. Each rule can choose otherwise with `when_unreachable: allow` (and the top-level `when_unreachable:` sets the
+default). The hooks, MCP connectors and `client.py` keep a copy of these answers while the gateway answers, so they
+follow them while it's down. What runs then isn't recorded. `GATEWAY_FAIL_OPEN=1` on a machine still lets everything
+through there.
 
 ### Does my data leave my machine?
 
@@ -449,7 +479,9 @@ blocked one the program (like `rm`) and the rule. See [Usage sharing](#usage-sha
 
 ### Does Squidbrake use an LLM to make decisions?
 
-No. Squidbrake uses **deterministic rules and checks**. There is no LLM in the decision path.
+No. Squidbrake uses **deterministic rules and checks**. There is no LLM in the decision path. The optional AI brief
+(Settings → AI approval briefs, your own Anthropic key, `pip install "squidbrake[ai]"`) writes a short risk note for
+the person deciding on a held action; nothing reads it to decide.
 
 ### Can an agent get around Squidbrake?
 
@@ -512,6 +544,17 @@ in the file. `verify.py` needs only the Python standard library. The dashboard's
 Add `--json` for one machine-readable object (`ok`, the number of records checked, and a list of problems with the
 record each one was found in) for CI; the exit code stays 0/1 either way.
 
+**Signed checkpoints.** Every 50 entries the gateway signs the chain's fingerprint with its ledger key (Ed25519, kept in
+`data/ledger.key` or `SQUIDBRAKE_LEDGER_KEY`). The public half is published, without a key, at `GET /v1/audit/public-key`.
+Publish it somewhere you control (your site, your auditor's ticket); then
+
+```bash
+python verify.py squidbrake-evidence-20261001-0930.json --key <the published public key>
+```
+
+also proves the file wasn't re-chained by someone with access to the database. Approvals made with a passkey carry the
+device's signature, and `verify.py` checks those too (keep `signing.py` next to `verify.py`).
+
 ## Behaviour notes
 
 - **Fail closed**: the Python client refuses to run a tool if the gateway is unreachable
@@ -523,7 +566,10 @@ record each one was found in) for CI; the exit code stays 0/1 either way.
 - **Upgrades**: new columns are added to an existing database automatically at startup.
 - **Redaction**: keys like `password`, `token`, `api_key`, `authorization`, `cookie` and values like
   `Bearer ...`, `sk-...`, `ghp_...`, AWS, Slack, Stripe, Google and npm keys, JWTs, private keys and the password in a
-  URL (`postgres://user:...@host`) are stored as `[REDACTED]`. Rules still see the raw input.
+  URL (`postgres://user:...@host`) are stored as `[REDACTED]`. Email addresses are stored as `p.redacted-3f2a9c@domain`
+  (first letter, a fingerprint, the domain) and card numbers as `[card ending 4242]`
+  (`SQUIDBRAKE_REDACT_PERSONAL=0` turns those two off). Rules still see the raw input. Lists, the phone page,
+  notifications and AI briefs show at most `MAX_PREVIEW_CHARS` (2 KB) of any value.
 - Payloads over `MAX_PAYLOAD_CHARS` are truncated in storage. Proxy responses are buffered (no streaming/SSE).
 - SQLite (WAL) is fine for one machine. For several gateway replicas, set `DATABASE_URL` to Postgres.
 

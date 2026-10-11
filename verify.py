@@ -1,22 +1,34 @@
 """
 Check a Squidbrake evidence file on any machine, without trusting the server that produced it.
 
-    python verify.py squidbrake-evidence-20261001.json [--json]
+    python verify.py squidbrake-evidence-20261001.json [--json] [--key PUBLIC_KEY_HEX]
 
 Download the file from the dashboard (Reports > Tamper check > Download evidence) or GET /v1/audit/export.json.
-Only the Python standard library is needed. It checks that:
+Only the Python standard library is needed (keep signing.py from the repository next to this file). It checks that:
 
   1. the audit trail is one unbroken hash chain from the first entry (nothing edited, removed or inserted);
   2. every recorded action's input and result still match the fingerprints taken when they happened;
-  3. every decision names the version of the rules that made it, and that version's text is in the file.
+  3. every decision names the version of the rules that made it, and that version's text is in the file;
+  4. every signed checkpoint (one per 50 entries) is a valid signature, by the gateway's ledger key, over the chain
+     exactly as it is in the file. Pass the key the gateway published (GET /v1/audit/public-key) with --key, so a
+     file re-signed with some other key is caught too;
+  5. every approval made with a passkey (Face ID, fingerprint) carries that device's valid signature.
 
 Exit code 0 if everything checks out, 1 if anything doesn't.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import signing
+except ImportError:  # pragma: no cover - verify.py copied on its own
+    signing = None
 
 GENESIS = "0" * 64
 FORMAT = "squidbrake-evidence/1"
@@ -79,7 +91,83 @@ def check_rules(entries: list[dict], policies: dict[str, str]) -> dict:
     return {"versions": sorted(used), "missing": sorted(missing), "mismatched": wrong}
 
 
-def verify(data: dict) -> dict:
+def check_checkpoints(entries: list[dict], checkpoints: list[dict], public_key: str | None,
+                      pinned: str | None = None) -> dict:
+    """Each checkpoint: the entry it names has the fingerprint it signed, and the signature is the ledger key's."""
+    out = {"ok": True, "count": len(checkpoints), "valid": 0, "last_seq": None, "key": public_key, "pinned": bool(pinned),
+           "message": "no signed checkpoints yet" if not checkpoints else ""}
+    if pinned and public_key and pinned.lower() != public_key.lower():
+        out.update(ok=False, message="the file was signed with a different key than the one you gave with --key")
+        return out
+    key = pinned or public_key
+    if checkpoints and (signing is None or not key):
+        out.update(ok=False, message="can't check the signatures: " + (
+            "signing.py isn't next to verify.py" if signing is None else "the file has no public key; pass --key"))
+        return out
+    hashes = {e.get("seq"): e["hash"] for e in entries}
+    try:
+        pub = bytes.fromhex(key) if key else b""
+    except ValueError:
+        out.update(ok=False, message="the public key isn't hex")
+        return out
+    for cp in checkpoints:
+        seq = cp["seq"]
+        if hashes.get(seq) != cp["head_hash"]:
+            out.update(ok=False, message=f"checkpoint at entry #{seq} doesn't match the chain: the history was rewritten "
+                                         "after it was signed")
+            return out
+        try:
+            good = signing.ed25519_verify(pub, signing.checkpoint_message(seq, cp["head_hash"]),
+                                          bytes.fromhex(cp["signature"]))
+        except ValueError:
+            good = False
+        if not good:
+            out.update(ok=False, message=f"checkpoint at entry #{seq} has a signature the ledger key didn't make")
+            return out
+        out["valid"] += 1
+        out["last_seq"] = seq
+    if checkpoints:
+        out["message"] = f"{out['valid']} signed checkpoint(s) valid, the latest at entry #{out['last_seq']}"
+    return out
+
+
+def _b64d(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def check_device_approvals(entries: list[dict], devices: dict[str, dict]) -> dict:
+    """Approvals made with a passkey: the device's signature over the approval challenge (WebAuthn assertion)."""
+    checked, bad = 0, []
+    for e in entries:
+        if e["action"] not in ("event.approved", "event.rejected"):
+            continue
+        proof = json.loads(e["detail"] or "{}").get("device_proof")
+        if not proof:
+            continue
+        checked += 1
+        dev = devices.get(proof.get("credential_id"))
+        ok = False
+        if dev and signing is not None:
+            try:
+                auth = _b64d(proof["authenticator_data"])
+                client = _b64d(proof["client_data_json"])
+                cd = json.loads(client)
+                key = json.loads(dev["public_key"]) if isinstance(dev["public_key"], str) else dev["public_key"]
+                parts = str(proof.get("statement") or "").split("|")
+                wanted = "approve" if e["action"] == "event.approved" else "reject"
+                bound = (len(parts) == 4 and parts[1] == e["target"] and parts[2] == wanted and proof.get("challenge")
+                         == base64.urlsafe_b64encode(hashlib.sha256(proof["statement"].encode()).digest()).decode().rstrip("="))
+                ok = (bound and cd.get("type") == "webauthn.get" and cd.get("challenge") == proof.get("challenge")
+                      and signing.p256_verify(int(key["x"], 16), int(key["y"], 16),
+                                              auth + hashlib.sha256(client).digest(), _b64d(proof["signature"])))
+            except (KeyError, ValueError, TypeError):
+                ok = False
+        if not ok:
+            bad.append(e.get("seq"))
+    return {"checked": checked, "bad": bad}
+
+
+def verify(data: dict, pinned_key: str | None = None) -> dict:
     if data.get("format") != FORMAT:
         return {"ok": False, "message": f"not a Squidbrake evidence file (format {data.get('format')!r})"}
     entries = data.get("entries") or []
@@ -87,10 +175,14 @@ def verify(data: dict) -> dict:
     events = {e["id"]: e for e in data.get("events") or []}
     evs = check_events(entries, events)
     rules = check_rules(entries, data.get("policies") or {})
-    ok = chain["ok"] and not evs["changed"] and not rules["missing"] and not rules["mismatched"]
+    cps = check_checkpoints(entries, data.get("checkpoints") or [], (data.get("ledger_key") or {}).get("public_key"),
+                            pinned_key)
+    devs = check_device_approvals(entries, {d["credential_id"]: d for d in data.get("devices") or []})
+    ok = chain["ok"] and not evs["changed"] and not rules["missing"] and not rules["mismatched"] and cps["ok"] \
+        and not devs["bad"]
     if data.get("head_hash") and chain["ok"] and data["head_hash"] != chain["head_hash"]:
         ok, chain["message"] = False, "the chain doesn't end at the fingerprint the file says it does"
-    return {"ok": ok, "chain": chain, "events": evs, "rules": rules}
+    return {"ok": ok, "chain": chain, "events": evs, "rules": rules, "checkpoints": cps, "devices": devs}
 
 
 def report(result: dict) -> str:
@@ -107,6 +199,17 @@ def report(result: dict) -> str:
                  + f"Rules: decisions were made by {len(r['versions'])} version(s) of rules.yaml"
                  + (f"; missing from the file: {', '.join(r['missing'])}" if r["missing"] else "")
                  + (f"; text doesn't match its fingerprint: {', '.join(r['mismatched'])}" if r["mismatched"] else "") + ".")
+    cp = result.get("checkpoints") or {"ok": True, "count": 0, "message": "no signed checkpoints yet"}
+    pin_note = ""
+    if cp["ok"] and cp["count"]:
+        pin_note = (" (key checked against the one you gave)" if cp.get("pinned") else
+                    " (pass --key with the gateway's published key to rule out a re-signed file)")
+    lines.append(("✓ " if cp["ok"] else "✗ ") + f"Signatures: {cp['message']}{pin_note}.")
+    dv = result.get("devices") or {"checked": 0, "bad": []}
+    if dv["checked"]:
+        lines.append(("✓ " if not dv["bad"] else "✗ ") + f"Passkey approvals: {dv['checked']} checked"
+                     + (f", {len(dv['bad'])} without a valid device signature (entries "
+                        f"{', '.join(map(str, dv['bad'][:10]))})" if dv["bad"] else ", each signed by its device") + ".")
     lines.append("RESULT: " + ("everything checks out." if result["ok"] else "this evidence has been tampered with."))
     return "\n".join(lines)
 
@@ -125,6 +228,12 @@ def json_report(result: dict) -> dict:
         problems.append({"record": fp, "problem": "the rules version that made a decision is missing from the file"})
     for fp in r["mismatched"]:
         problems.append({"record": fp, "problem": "the rules text doesn't match its fingerprint"})
+    cp = result.get("checkpoints") or {"ok": True}
+    if not cp["ok"]:
+        problems.append({"record": None, "problem": cp["message"]})
+    for seq in (result.get("devices") or {}).get("bad", []):
+        problems.append({"record": seq, "problem": "an approval says it was made with a passkey, but its signature "
+                                                   "doesn't check"})
     return {"ok": result["ok"], "records": c["entries"], "problems": problems}
 
 
@@ -136,6 +245,11 @@ def main(argv: list[str] | None = None) -> int:
         pass
     as_json = "--json" in argv
     argv = [a for a in argv if a != "--json"]
+    pinned = None
+    if "--key" in argv:
+        i = argv.index("--key")
+        pinned = argv[i + 1] if i + 1 < len(argv) else ""
+        argv = argv[:i] + argv[i + 2:]
     if len(argv) != 1:
         print(__doc__.strip())
         return 2
@@ -149,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("✗ " + message)
         return 2
-    result = verify(data)
+    result = verify(data, pinned)
     print(json.dumps(json_report(result)) if as_json else report(result))
     return 0 if result["ok"] else 1
 

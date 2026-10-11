@@ -39,6 +39,44 @@ default_reason: This changes something, so a person has to approve it
 mode: enforce
 shadow_agents: []          # shadow mode for just these agents (source or key names, globs), e.g. ["new-bot*"]
 
+# While Squidbrake can't be reached: block (the default) or allow. Each rule can say its own with
+# `when_unreachable: allow` (e.g. reads). Agents keep a copy of these answers, so they follow them while it's down.
+# What runs while it's down isn't recorded, so allow only what you'd accept unrecorded.
+when_unreachable: block
+
+# Undo copies: before an action that waits for a person, or a command that can't be undone, keep a copy of what it
+# changes (files and git changes on the agent's computer, the record behind an API call through /proxy, or what a
+# client.py snapshot function returns). required: if no copy can be made, it doesn't run. best_effort: try, run anyway.
+# off: don't. A rule can set its own `snapshot: required | best_effort | off`; `snapshot: required` on a rule also
+# blocks paths that can't make a copy at all (an MCP tool).
+snapshots: required
+
+# Spend limits: pause an agent once it has used this many model tokens (or dollars, `usd:`) in a day or month.
+# per: agent gives each matching agent its own limit; per: together shares one between them. Claude Code reports its
+# tokens by itself; other agents send them to POST /v1/usage (client.py: gw.usage(...)).
+# budgets:
+#   - id: daily-tokens
+#     match: { source: "*" }
+#     per: agent
+#     period: day
+#     tokens: 5000000
+
+# Proof of work: when an agent says an action is done, look in the real system. Credentials only come from the
+# gateway's environment. The answer (confirmed / not actually done) is recorded and a person is told on a mismatch.
+# proof_checks:
+#   - id: refund-really-made
+#     match: { name: "*refund*" }
+#     stripe: { object: refunds, id: "{output.id}" }             # STRIPE_SECRET_KEY
+#     expect: { status: succeeded }
+#   - id: pr-really-open
+#     match: { name: "*create_pull_request*" }
+#     github: { path: "repos/{input.owner}/{input.repo}/pulls/{output.number}" }   # GITHUB_TOKEN
+#     expect: { state: open }
+#   - id: order-really-updated
+#     match: { name: "orders.update_status" }
+#     sql: { url_env: ORDERS_DB_URL, query: "select status from orders where id = :id", params: { id: "{input.order_id}" } }
+#     expect: { status: "{input.status}" }
+
 # History checks look at what happened BEFORE an action, not just the action itself.
 # Each one: block (stop it), review (a person decides), warn (flag it for the approver), off.
 history_checks:

@@ -419,6 +419,13 @@ dialog .acts { display: flex; justify-content: flex-end; gap: 8px; margin-top: 1
 
 /* story + history warnings */
 .signals { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 6px; margin: 2px 0 10px; }
+.brief { border-radius: 8px; padding: 8px 10px; font-size: 13px; border: 1px solid var(--border); border-left: 4px solid var(--accent, #2a78d6);
+         background: var(--surface-2); white-space: pre-wrap; margin-top: 6px; }
+.brief .who { font-size: 11.5px; color: var(--text-muted); margin-top: 4px; }
+.proof-ok { color: var(--good); font-weight: 600; } .proof-bad { color: var(--critical); font-weight: 600; }
+.meter { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin-top: 4px; min-width: 80px; }
+.meter > i { display: block; height: 100%; background: var(--good); }
+.meter.over > i { background: var(--critical); }
 .signal { border-radius: 8px; padding: 8px 10px; font-size: 13px; border: 1px solid var(--border); border-left-width: 4px; background: var(--surface-2); }
 .signal.block { border-left-color: var(--critical); }
 .signal.review { border-left-color: var(--serious); }
@@ -605,8 +612,9 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
   <div id="view-team" class="view" hidden>
     <section class="card">
       <div class="card-head"><h2>People and agents</h2><span class="sub" id="teamSub"></span></div>
-      <p class="lede">Each person and each AI agent gets its own key. People can open this dashboard; approvers can approve
-        held actions; admins manage the team and settings. Agents can only ask permission and report what they did.
+      <p class="lede">Each person and each AI agent gets its own key. <b>Viewers</b> can look at everything and change
+        nothing; <b>approvers</b> also approve held actions and can stop agents; <b>admins</b> manage the team and settings;
+        <b>owners</b> also decide who is an admin or owner. Agents can only ask permission and report what they did.
         Roles such as <code>finance</code> let rules require a specific team to approve.</p>
       <p class="lede">Setting this up for a team? <a href="https://pilots.squidbrake.com/team?from=dashboard" target="_blank"
         rel="noopener">Tell us about your team</a> and we'll help with rules, approvers and rolling it out, or
@@ -625,8 +633,9 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
         <label>Type
           <select name="kind"><option value="person">Person</option><option value="agent">AI agent</option></select></label>
         <label class="person-only">Access
-          <select name="access"><option value="approver">Can approve</option><option value="viewer">Can view only</option></select></label>
-        <label class="person-only">Roles <input name="roles" placeholder="e.g. finance, admin"></label>
+          <select name="access"><option value="approver">Approver: can approve</option><option value="viewer">Viewer: can view only</option>
+            <option value="admin">Admin: manages team and settings</option><option value="owner">Owner: also manages admins</option></select></label>
+        <label class="person-only">Teams (optional) <input name="roles" placeholder="e.g. finance, ops"></label>
         <label class="agent-only" hidden>Works for
           <select name="owner" id="ownerSel"><option value="">nobody in particular</option></select>
           <span class="hint">With second-person approval on, this person can't approve what their own agent asks for.</span></label>
@@ -671,6 +680,12 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
         <th>Agent</th><th class="num">Actions</th><th class="num">Blocked</th><th class="num">Held</th><th class="num">Approved</th>
         <th class="num">Rejected</th><th class="num">Failed</th><th>Last seen</th><th></th></tr></thead>
         <tbody id="repAgents"></tbody></table></div>
+    </section>
+    <section class="card" id="spendCard" hidden>
+      <div class="card-head"><h2>Spend limits</h2><span class="sub">model tokens this period; an agent over its limit is paused until it resets</span></div>
+      <div class="tbl-wrap"><table class="events"><thead><tr><th>Limit</th><th>Agent</th><th>Used</th><th></th><th>Resets</th></tr></thead>
+        <tbody id="spendRows"></tbody></table></div>
+      <p class="hint">Set in rules.yaml under <code>budgets:</code>. Claude Code reports its tokens by itself; other agents send them to <code>POST /v1/usage</code>.</p>
     </section>
     <div class="row2 even">
       <section class="card">
@@ -757,6 +772,33 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
           <button class="btn" type="button" id="testNotify">Send a test notification</button>
           <span class="hint" id="settingsMsg"></span>
         </div>
+      </form>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>Approve with Face ID or fingerprint</h2><span class="sub" id="devSub"></span></div>
+      <p class="lede">Register your phone or laptop as a passkey. Each approval you make with it is signed by the device
+        and kept in the audit trail as proof of who approved what; anyone with an export can check the signature.</p>
+      <div class="tbl-wrap"><table class="events"><thead><tr><th>Device</th><th>Person</th><th>Added</th><th>Last used</th><th></th></tr></thead>
+        <tbody id="devRows"></tbody></table></div>
+      <div class="form-actions" style="margin-top:10px">
+        <button class="btn primary" type="button" id="devAdd">Set up Face ID / fingerprint on this device</button>
+        <span class="hint" id="devMsg"></span></div>
+      <label class="check full" style="margin-top:10px" data-admin hidden><input type="checkbox" id="devRequired"> Approvals need Face ID or fingerprint
+        <span class="hint">Approvals from Slack buttons, phone notification buttons and plain links are refused; people approve on the page,
+          on a registered device. Rejecting never needs it. Register your own device first.</span></label>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>AI approval briefs</h2></div>
+      <p class="lede">A short, plain-English risk note on each action waiting for a person, written with your team's own
+        Anthropic key. It only advises: the rules decide what's held and people decide what runs. What it reads is what this
+        dashboard shows (redacted, previews capped); with no key, nothing is sent anywhere.</p>
+      <form class="form-grid wide" id="aiForm">
+        <label class="check full"><input type="checkbox" name="ai_briefs"> Write a brief for each held action</label>
+        <label class="full">Anthropic API key <input name="ai_key" type="password" autocomplete="off" placeholder="sk-ant-…">
+          <span class="hint" id="aiKeyHint">Kept on this gateway and never shown again.</span></label>
+        <label>Model <input name="ai_model" placeholder="claude-opus-5-5"></label>
+        <div class="form-actions full"><button class="btn primary" type="submit">Save</button>
+          <button class="btn" type="button" id="aiForget">Remove key</button><span class="hint" id="aiMsg"></span></div>
       </form>
     </section>
     <section class="card">
@@ -989,6 +1031,35 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
     return data;
   }
   const apiPost = (path, body) => apiSend("POST", path, body);
+
+  // ---------- passkeys (Face ID, fingerprint): sign approvals with this device
+  const fromB64u = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), (c) => c.charCodeAt(0));
+  const toB64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const passkeysWork = () => !!(window.PublicKeyCredential && navigator.credentials && window.isSecureContext);
+  let myDevices = [], devicesRequired = false;
+  async function loadDevices() {
+    try { const r = await api("/v1/devices"); myDevices = r.devices.filter((d) => d.person === (me && me.client)); devicesRequired = r.required; return r; }
+    catch { myDevices = []; return null; }
+  }
+  // The device's signature over exactly this decision, or null when this browser has no registered passkey.
+  async function deviceProof(eventId, outcome) {
+    if (!myDevices.length || !passkeysWork()) {
+      if (devicesRequired && outcome === "approve") throw new Error("Approvals need Face ID or fingerprint: set it up in Settings on this device, or approve from your registered phone.");
+      return null;
+    }
+    const ch = await apiPost(`/v1/events/${encodeURIComponent(eventId)}/challenge`, { outcome });
+    const cred = await navigator.credentials.get({ publicKey: { challenge: fromB64u(ch.challenge), rpId: ch.rp_id,
+      userVerification: "required", timeout: 60000, allowCredentials: ch.allow_credentials.map((id) => ({ type: "public-key", id: fromB64u(id) })) } });
+    return { credential_id: toB64u(cred.rawId), statement: ch.statement, authenticator_data: toB64u(cred.response.authenticatorData),
+             client_data_json: toB64u(cred.response.clientDataJSON), signature: toB64u(cred.response.signature) };
+  }
+  async function registerDevice(name) {
+    const o = await apiPost("/v1/devices/register/start");
+    const cred = await navigator.credentials.create({ publicKey: { ...o, challenge: fromB64u(o.challenge),
+      user: { ...o.user, id: fromB64u(o.user.id) }, excludeCredentials: o.excludeCredentials.map((c) => ({ ...c, id: fromB64u(c.id) })) } });
+    return apiPost("/v1/devices/register/finish", { name, challenge: o.challenge, credential_id: toB64u(cred.rawId),
+      client_data_json: toB64u(cred.response.clientDataJSON), attestation_object: toB64u(cred.response.attestationObject) });
+  }
   let toastTimer;
   function toast(msg) {
     let t = $("#toast");
@@ -1621,6 +1692,7 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
     $("#meName").textContent = me.auth_enabled === false ? "Local" : me.client;
     $("#keyBtn").hidden = me.auth_enabled === false;
     document.querySelectorAll("[data-admin]").forEach((n) => (n.hidden = !me.is_admin));
+    if (me.can_approve) loadDevices();
     $("#stopBtn").hidden = !(me.can_approve || me.is_admin);
     const shadowAll = me.mode === "shadow", shadowSome = (me.shadow_agents || []).length > 0;
     $("#shadowBanner").hidden = !(shadowAll || shadowSome);
@@ -1664,7 +1736,8 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
       const btns = ev.target.parentElement.querySelectorAll("button");
       btns.forEach((b) => (b.disabled = true));
       try {
-        await apiPost(`/v1/events/${encodeURIComponent(e.id)}/${outcome}`, { note: note.value.trim() || null });
+        const device_proof = await deviceProof(e.id, outcome);
+        await apiPost(`/v1/events/${encodeURIComponent(e.id)}/${outcome}`, { note: note.value.trim() || null, device_proof });
         toast(`${outcome === "approve" ? "Approved" : "Rejected"} ${e.name}`);
         shortcutIndexHint = Math.max(0, queue.findIndex((q) => q.id === e.id));   // the next `j` lands on the request that moved up
         queue = queue.filter((q) => q.id !== e.id);
@@ -1796,6 +1869,7 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
           ),
           el("div", { class: "side" }, clockEl(e), decisionControls(e, true)),
           el("div", { class: "inp", title: preview(e.input), text: preview(e.input) }),
+          briefEl(e),
           signalsEl(e.signals),
           storyDetails(e),
         );
@@ -1862,7 +1936,8 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
         el("div", { class: "muted", style: "margin-top:4px", text: `Rule: ${e.reason || e.rule_id || ""}` }));
     }
     return el("div", { class: "banner " + (e.decision === "allow" ? "approved" : "denied") },
-      el("b", { text: `${e.decision === "allow" ? "Approved" : "Rejected"} by ${e.decided_by}` }), when, note,
+      el("b", { text: `${e.decision === "allow" ? "Approved" : "Rejected"} by ${e.decided_by}` }), when,
+      e.decided_with ? el("span", { class: "tag", style: "margin-left:6px", title: "Signed by the device; the signature is in the audit trail", text: `✓ ${e.decided_with}` }) : null, note,
       el("div", { class: "muted", style: "margin-top:4px", text: `Held by: ${e.reason || ""}${e.rule_id ? " (" + e.rule_id + ")" : ""}` }));
   }
   // ---------- the story behind an action: history-check warnings + what the agent did just before
@@ -1871,6 +1946,40 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
     repeat_of_rejected: "Already rejected before", duplicate_change: "Done before",
     catastrophic_command: "Destructive command", irreversible_command: "Can't be undone", hidden_command: "Hidden code", sequence: "Pattern", untrusted_destination: "Address from outside content", after_untrusted: "After reading outside content",
   };
+  // The AI brief: advice for the person deciding, written with the team's own key. Never part of the decision.
+  function briefEl(e) {
+    if (!e.brief) return null;
+    if (e.brief.error) return el("div", { class: "hint", text: `AI brief unavailable: ${e.brief.error}` });
+    return el("div", { class: "brief" }, el("b", { text: "AI brief (advice only): " }), e.brief.text,
+      el("div", { class: "who", text: `${e.brief.model || ""} · the rules held it; you decide` }));
+  }
+  function snapshotEl(e) {
+    const s = e.snapshot;
+    if (!s || !(s.id || s.skipped || s.want)) return null;
+    if (s.skipped) return el("div", { class: "banner failed" }, el("b", { text: "No undo copy: " }), s.skipped);
+    if (!s.id) return e.status === "awaiting_approval" ? el("div", { class: "hint", text: `A copy will be kept before it runs (${s.want}).` }) : null;
+    const kids = [el("b", { text: "Undo copy kept before it ran: " }), s.summary || s.ref || ""];
+    if (s.kind === "local") kids.push(el("div", { class: "hint", text: `On ${agentOf(e)}'s computer: squidbrake undo ${s.ref}${e.name === "Edit" || e.name === "Write" ? " --force" : ""}` }));
+    else kids.push(" ", el("button", { class: "linkish", text: "download the copy", onclick: async () => {
+      try {
+        const r = await api(`/v1/events/${encodeURIComponent(e.id)}/snapshots`);
+        const url = URL.createObjectURL(new Blob([JSON.stringify(r.snapshots, null, 2)], { type: "application/json" }));
+        el("a", { href: url, download: `squidbrake-undo-${e.id}.json` }).click();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+      } catch (err) { toast(err.message); }
+    } }));
+    return el("div", { class: "banner approved" }, ...kids);
+  }
+  function proofEl(e) {
+    if (!e.proof_status) return null;
+    const ok = e.proof_status === "confirmed";
+    return el("div", { class: "banner " + (ok ? "approved" : "denied") },
+      el("b", { class: ok ? "proof-ok" : "proof-bad", text: ok ? "✓ Checked: it really happened. " : e.proof_status === "mismatch" ? "✕ Not actually done. " : "! Couldn't check. " }),
+      (e.proof && e.proof.message) || "", " ",
+      el("button", { class: "linkish", text: "check again", onclick: async () => {
+        try { await apiPost(`/v1/events/${encodeURIComponent(e.id)}/proof`); refreshDrawer(); } catch (err) { toast(err.message); }
+      } }));
+  }
   function signalsEl(signals) {
     if (!signals || !signals.length) return null;
     return el("div", { class: "signals" }, signals.map((s) => el("div", { class: "signal " + s.effect },
@@ -1940,6 +2049,11 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
     const body = $("#drBody");
     const kids = [approvalBanner(e)];
     if (e.status === "denied" && !e.decided_by) kids.push(el("div", { class: "banner denied" }, el("b", { text: "Blocked: " }), e.reason || "", e.rule_id ? el("span", { class: "muted mono", text: `  (${e.rule_id})` }) : null));
+    kids.push(briefEl(e), snapshotEl(e), proofEl(e));
+    if (e.status === "awaiting_approval" && !e.brief && me && me.can_approve)
+      kids.push(el("button", { class: "linkish", text: "Ask AI for a brief", onclick: async () => {
+        try { await apiPost(`/v1/events/${encodeURIComponent(e.id)}/brief`); refreshDrawer(); } catch (err) { toast(err.message); }
+      } }));
     kids.push(signalsEl(e.signals));
     const story = el("div", { class: "blk" }, el("h4", { text: "Chain" }), el("div", { class: "muted", text: "Loading…" }));
     kids.push(story);
@@ -2138,15 +2252,16 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
     $("#teamSub").textContent = data.managed_by_env ? "managed by the GATEWAY_API_KEYS setting" : `${data.members.length} keys`;
     const admin = me && me.is_admin && !data.managed_by_env;
     $("#addMemberCard").hidden = !admin;
+    const LEVEL = { owner: "Owner", admin: "Admin", approver: "Approver", viewer: "Viewer (view only)" };
     const access = (m) => m.kind === "agent" ? (m.owner ? `Asks permission · works for ${m.owner}` : "Asks permission")
-      : m.roles.includes("admin") ? "Admin" : m.approver ? "Can approve" : "Can view";
+      : LEVEL[m.access] || (m.roles.includes("admin") ? "Admin" : m.approver ? "Approver" : "Viewer (view only)");
     $("#ownerSel").replaceChildren(el("option", { value: "", text: "nobody in particular" }),
       ...data.members.filter((m) => m.kind === "person").map((m) => el("option", { value: m.name, text: m.name })));
     $("#teamRows").replaceChildren(...data.members.map((m) => el("tr", {},
       el("td", {}, m.kind === "agent" ? avatarEl(m.name, "sm") : null, m.kind === "agent" ? " " : null, el("b", { text: m.name }), m.name === me.client ? el("span", { class: "muted", text: "  (you)" }) : null),
       el("td", { class: "sec", text: m.kind === "agent" ? "🤖 AI agent" : "👤 Person" }),
       el("td", { text: access(m) }),
-      el("td", {}, m.roles.length ? m.roles.map((r) => el("span", { class: "tag" + (r === "admin" ? " admin" : ""), text: r })) : el("span", { class: "muted", text: "—" })),
+      el("td", {}, m.roles.filter((r) => r !== "admin" && r !== "owner").length ? m.roles.filter((r) => r !== "admin" && r !== "owner").map((r) => el("span", { class: "tag", text: r })) : el("span", { class: "muted", text: "—" })),
       el("td", { class: "sec", text: fmtDate(m.created_at) }),
       el("td", { class: "num" }, admin && m.name !== me.client ? [
         m.kind === "person" ? el("button", { class: "linkish", text: "Edit", onclick: () => editMember(m) }) : null, " ",
@@ -2155,10 +2270,15 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
     )));
   }
   function editMember(m) {
-    const roles = prompt(`Roles for ${m.name} (comma separated, e.g. finance, admin):`, m.roles.join(", "));
-    if (roles === null) return;
-    const approver = confirm(`Can ${m.name} approve held actions?\n\nOK = yes, Cancel = view only`);
-    apiSend("PATCH", `/v1/team/${encodeURIComponent(m.name)}`, { roles: roles.split(",").map((r) => r.trim()).filter(Boolean), approver })
+    const levels = ["viewer", "approver", "admin", "owner"];
+    const access = prompt(`Access for ${m.name}: viewer, approver, admin or owner\n(only owners make admins and owners)`, m.access || "approver");
+    if (access === null) return;
+    if (!levels.includes(access.trim().toLowerCase())) { toast("Use viewer, approver, admin or owner"); return; }
+    const teams = prompt(`Teams for ${m.name}, for rules that need a team to approve (comma separated, e.g. finance):`,
+      m.roles.filter((r) => r !== "admin" && r !== "owner").join(", "));
+    if (teams === null) return;
+    apiSend("PATCH", `/v1/team/${encodeURIComponent(m.name)}`, { access: access.trim().toLowerCase(),
+      roles: teams.split(",").map((r) => r.trim()).filter(Boolean) })
       .then(() => { toast(`Updated ${m.name}`); loadTeam(); }).catch((err) => toast(err.message));
   }
   function removeMember(m) {
@@ -2175,7 +2295,7 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
     ev.preventDefault();
     const f = addForm, person = f.kind.value === "person";
     try {
-      const r = await apiPost("/v1/team", { name: f.name.value.trim(), kind: f.kind.value, approver: person && f.access.value === "approver",
+      const r = await apiPost("/v1/team", { name: f.name.value.trim(), kind: f.kind.value, access: person ? f.access.value : null,
         roles: person ? f.roles.value.split(",").map((x) => x.trim()).filter(Boolean) : [],
         owner: person ? null : f.owner.value || null });
       const box = $("#newKey");
@@ -2242,6 +2362,9 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
           el("div", { class: "sec", text: `${nf.format(au.entries)} entries. ${au.message}.` }),
           el("div", { class: "muted", style: "margin-top:6px;font-size:12.5px", text: "Each entry is chained to the one before by a fingerprint, so any edit or deletion shows up here. Keep this fingerprint to prove later that today's history hasn't changed:" }),
           el("div", { class: "fp", text: au.head_hash || "—" }),
+          au.checkpoints ? el("div", { class: "sec", style: "margin-top:8px", text: au.checkpoints.count
+            ? `${au.checkpoints.ok ? "✓" : "✕"} ${au.checkpoints.message}. Signed every 50 entries with this gateway's ledger key (public key: GET /v1/audit/public-key), so an export can be proven unedited.`
+            : "Signed checkpoints start at entry 50." }) : null,
           el("div", { style: "margin-top:10px" }, el("button", { class: "btn", text: "⬇ Download evidence", onclick: downloadEvidence }),
             el("span", { class: "muted", style: "margin-left:8px;font-size:12.5px", text: "Anyone can check it offline: python verify.py <file>" })))));
     const stoppedAgents = controlsState.agents || {};
@@ -2252,6 +2375,17 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
       el("td", { class: "num" }, me.is_admin && stoppedAgents[g.agent] ? el("button", { class: "linkish", text: "Resume", onclick: () => resume(g.agent) })
         : (me.can_approve || me.is_admin) && !stoppedAgents[g.agent] ? el("button", { class: "linkish", style: "color:var(--critical)", text: "Stop", onclick: () => askStop(g.agent) }) : null),
     )), "No agent activity in this period.");
+    api("/v1/budgets").then((b) => {
+      $("#spendCard").hidden = !b.budgets.length;
+      const pct = (s) => Math.min(100, Math.round(100 * (s.token_limit ? s.tokens / s.token_limit : s.usd / s.usd_limit)));
+      cells("#spendRows", b.spend.map((s) => el("tr", {},
+        el("td", { class: "mono", text: `${s.budget} (per ${s.period})` }),
+        el("td", {}, s.who === "together" ? "all its agents together" : el("b", { text: s.who })),
+        el("td", { text: s.token_limit ? `${nf.format(s.tokens)} / ${nf.format(s.token_limit)} tokens` : `$${s.usd.toFixed(2)} / $${s.usd_limit.toFixed(2)}` }),
+        el("td", {}, el("div", { class: "meter" + (s.paused ? " over" : "") }, el("i", { style: `width:${pct(s)}%` })),
+          s.paused ? el("span", { class: "tag", style: "border-color:var(--critical);color:var(--critical)", text: "paused" }) : null),
+        el("td", { class: "sec", text: fmtDate(s.resets_at) }))), "No spend reported this period.");
+    }).catch(() => { $("#spendCard").hidden = true; });
     cells("#repApprovers", a.by_approver.map((p) => el("tr", {}, el("td", { text: p.approver }),
       el("td", { class: "num", text: p.approved }), el("td", { class: "num", text: p.rejected }))), "No decisions yet.");
     cells("#repBlocked", r.blocked_by_rule.map((b) => el("tr", {}, el("td", { class: "mono", text: b.rule_id || "—" }),
@@ -2261,7 +2395,7 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
       const d = e.detail || {};
       const map = {
         "event.created": () => `${d.source || "?"} asked to run ${d.name} → ${d.status}${d.rule_id ? " (" + d.rule_id + ")" : ""}`,
-        "event.approved": () => `approved${d.via === "link" ? " from a notification link" : ""}${d.note ? ": “" + d.note + "”" : ""}`,
+        "event.approved": () => `approved${d.via === "link" ? " from a notification link" : ""}${d.decided_with ? " (" + d.decided_with + ", signed)" : ""}${d.note ? ": “" + d.note + "”" : ""}`,
         "event.rejected": () => `rejected${d.via === "link" ? " from a notification link" : ""}${d.note ? ": “" + d.note + "”" : ""}`,
         "event.expired": () => `nobody decided in time → ${d.outcome}`,
         "event.completed": () => `finished${d.duration_ms != null ? " in " + fmtDur(d.duration_ms) : ""}`,
@@ -2274,6 +2408,10 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
         "settings.updated": () => `changed settings: ${(d.changed || []).join(", ")}`,
         "audit.exported": () => `downloaded the audit CSV (${d.days} days)`,
         "phone.link_shown": () => "opened the phone link QR code",
+        "event.snapshot": () => d.skipped ? `no undo copy: ${d.skipped}` : `kept an undo copy (${d.kind}${d.ref ? " " + d.ref : ""})`,
+        "event.proof": () => `${d.status === "confirmed" ? "checked: it really happened" : d.status === "mismatch" ? "NOT actually done" : "couldn't check"}: ${d.message || ""}`,
+        "device.added": () => `added a Face ID / fingerprint device: ${e.target}`,
+        "device.removed": () => `removed the device ${e.target}`,
       };
       return (map[e.action] || (() => e.action))();
     };
@@ -2360,8 +2498,46 @@ dialog input#stopReason { width: 100%; border: 1px solid var(--border); backgrou
     $("#notifyAs").replaceChildren(...approvers.map((n) => el("option", { value: n, text: n, selected: n === s.notify_as ? "" : null })));
     $("#custForm").customers.value = (s.customers || []).join("\n");
     $("#custCount").textContent = s.customers && s.customers.length ? `${s.customers.length} on the list` : "";
+    const ai = $("#aiForm");
+    ai.ai_briefs.checked = !!s.ai_briefs; ai.ai_model.value = s.ai_model || ""; ai.ai_key.value = "";
+    $("#aiKeyHint").textContent = s.ai_key_set ? `A key ending ${s.ai_key_hint || "…"} is set. Paste a new one to replace it.` : "Kept on this gateway and never shown again.";
+    $("#devRequired").checked = !!s.require_device_signature;
+    renderDevices();
     loadMcp();
   }
+  async function renderDevices() {
+    const r = await loadDevices();
+    if (!r) return;
+    $("#devSub").textContent = r.required ? "required for approvals" : "";
+    cells("#devRows", r.devices.map((d) => el("tr", {}, el("td", {}, el("b", { text: d.name || "device" })), el("td", { text: d.person }),
+      el("td", { class: "sec", text: fmtDate(d.created_at) }), el("td", { class: "sec", text: d.last_used_at ? fmtAgo(d.last_used_at) : "never" }),
+      el("td", { class: "num" }, el("button", { class: "linkish", style: "color:var(--critical)", text: "Remove", onclick: async () => {
+        if (!confirm(`Remove ${d.name}? Approvals from it stop working.`)) return;
+        try { await apiSend("DELETE", `/v1/devices/${encodeURIComponent(d.credential_id)}`); renderDevices(); } catch (err) { toast(err.message); }
+      } })))), "No devices yet.");
+  }
+  $("#devAdd").addEventListener("click", async () => {
+    if (!passkeysWork()) { $("#devMsg").textContent = "This browser can't use passkeys here (it needs https, or localhost)."; return; }
+    const name = prompt("Name this device (e.g. Pat's iPhone):", /iPhone|iPad|Android|Mac|Windows/.exec(navigator.userAgent)?.[0] || "My device");
+    if (!name) return;
+    try { await registerDevice(name.trim()); $("#devMsg").textContent = "Added ✓ Your approvals from this device are now signed."; renderDevices(); }
+    catch (err) { $("#devMsg").textContent = err.name === "NotAllowedError" ? "Cancelled." : err.message; }
+  });
+  $("#devRequired").addEventListener("change", async (ev) => {
+    try { await apiSend("PUT", "/v1/settings", { require_device_signature: ev.target.checked }); renderDevices(); toast(ev.target.checked ? "Approvals now need Face ID or fingerprint" : "Plain approvals allowed again"); }
+    catch (err) { ev.target.checked = !ev.target.checked; toast(err.message); }
+  });
+  $("#aiForm").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const f = ev.target, body = { ai_briefs: f.ai_briefs.checked, ai_model: f.ai_model.value.trim() || null };
+    if (f.ai_key.value.trim()) body.ai_key = f.ai_key.value.trim();
+    try { await apiSend("PUT", "/v1/settings", body); $("#aiMsg").textContent = "Saved ✓"; loadSettings(); }
+    catch (err) { $("#aiMsg").textContent = err.message; }
+  });
+  $("#aiForget").addEventListener("click", async () => {
+    try { await apiSend("PUT", "/v1/settings", { ai_key: "", ai_briefs: false }); $("#aiMsg").textContent = "Key removed"; loadSettings(); }
+    catch (err) { $("#aiMsg").textContent = err.message; }
+  });
   $("#custForm").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     try {

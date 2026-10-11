@@ -12,7 +12,11 @@ It also records what you ask (UserPromptSubmit), so the gateway can tell address
 Install it with:  python connect.py claude-code   (or the Claude Code plugin: see plugin/README.md)
 Settings (env vars, set by connect.py in the hook command):
   GATEWAY_URL, GATEWAY_API_KEY, GATEWAY_SOURCE (default "claude-code"),
-  GATEWAY_FAIL_OPEN=1 to let calls run when the gateway is unreachable (default: block them)
+  GATEWAY_FAIL_OPEN=1 to let calls run when the gateway is unreachable (default: what rules.yaml's
+  when_unreachable says for that call, see offline.py; with no copy of it yet, block)
+
+It also reports the model tokens Claude Code used (read from the conversation's transcript file), so rules.yaml
+`budgets:` can pause an agent that's over its daily or monthly limit.
 """
 from __future__ import annotations
 
@@ -36,6 +40,10 @@ try:
     import hooklog   # which agent ran the hook and when, for `squidbrake doctor`
 except Exception:  # pragma: no cover
     hooklog = None
+try:
+    import offline   # what to do while the gateway is down (rules.yaml when_unreachable)
+except Exception:  # pragma: no cover
+    offline = None
 
 def _arg(flag: str, env: str, default: str) -> str:
     # Claude Code hook config has no env field, so connect.py passes settings as arguments.
@@ -93,6 +101,96 @@ def unreachable(url: str, e: httpx.HTTPError, what: str = "action") -> str:
             f"squidbrake connect all --remove")
 
 
+PAUSED = ("emergency-stop", "session-stop")
+EDITS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+
+def paused(d: dict) -> bool:
+    """Stopped, or over a spend limit: the agent should stop working, not just skip this call."""
+    return d.get("rule_id") in PAUSED or str(d.get("rule_id") or "").startswith("budget:") \
+        or (d.get("decision_note") or "").startswith("The session was stopped")
+
+
+def transcript_usage(ev: dict) -> tuple[dict | None, dict | None]:
+    """Tokens Claude Code used since the last report, from its transcript (one JSON object per line; each model reply
+    carries `usage`, repeated on every line of that reply, so replies are counted once by id).
+    -> (usage to send, the reading position to save once the gateway has it)."""
+    path, session = ev.get("transcript_path"), str(ev.get("session_id") or "")
+    if not path or not session:
+        return None, None
+    safe = "".join(c for c in session if c.isalnum() or c in "-_")[:80]
+    state_file = STATE_DIR / f"usage-{safe}.json"
+    try:
+        state = json.loads(state_file.read_text())
+    except (OSError, ValueError):
+        state = {"offset": 0, "seen": []}
+    seen = set(state.get("seen") or [])
+    total = {"input_tokens": 0, "output_tokens": 0, "model": None}
+    try:
+        with open(path, "rb") as f:
+            f.seek(int(state.get("offset") or 0))
+            chunk = f.read(20_000_000)
+    except (OSError, ValueError):
+        return None, None
+    end = chunk.rfind(b"\n") + 1                       # only whole lines; a half-written one is read next time
+    for line in chunk[:end].splitlines():
+        try:
+            msg = json.loads(line).get("message")
+        except (ValueError, AttributeError):
+            continue
+        if not isinstance(msg, dict):
+            continue
+        u, mid = msg.get("usage"), msg.get("id")
+        if not isinstance(u, dict) or not mid or mid in seen:
+            continue
+        seen.add(mid)
+        total["input_tokens"] += int(u.get("input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0)
+        total["output_tokens"] += int(u.get("output_tokens") or 0)
+        total["model"] = msg.get("model") or total["model"]
+    new_state = {"file": state_file, "offset": int(state.get("offset") or 0) + end, "seen": list(seen)[-500:]}
+    return (total if total["input_tokens"] or total["output_tokens"] else None), new_state
+
+
+def save_usage_state(new_state: dict | None) -> None:
+    if new_state:
+        try:
+            STATE_DIR.mkdir(exist_ok=True)
+            new_state["file"].write_text(json.dumps({"offset": new_state["offset"], "seen": new_state["seen"]}))
+        except OSError:
+            pass
+
+
+def keep_copy(ev: dict, line: str | None, d: dict, http: httpx.Client) -> None:
+    """Undo: back up what this call destroys or overwrites, before it runs. When the rules require a copy and none
+    could be made, the call doesn't run (and the gateway is told why)."""
+    want, strict = d.get("snapshot"), bool(d.get("snapshot_strict"))
+    kept = None
+    if line and undo is not None:
+        kept = undo.snapshot(line, ev.get("cwd"))
+    elif ev.get("tool_name") in EDITS and undo is not None:
+        inp = ev.get("tool_input") or {}
+        kept = undo.snapshot_files([str(inp.get("file_path") or inp.get("notebook_path") or "")], ev.get("cwd"),
+                                   str(ev.get("tool_name")).lower())
+    elif want and strict:
+        kept = {"skipped": f"Squidbrake can't keep a copy of what {ev.get('tool_name')} changes from here"}
+    if want and kept is not None:
+        body = {"skipped": kept["skipped"]} if kept.get("skipped") else \
+            {"kind": "local", "ref": kept["id"], "summary": undo.describe(kept)}
+        try:
+            http.post(f"/v1/events/{d['event_id']}/snapshot", json=body)
+        except httpx.HTTPError:
+            pass
+    if kept and kept.get("skipped") and want == "required":
+        try:
+            http.post(f"/v1/events/{d['event_id']}/result", json={"error": f"not run: no undo copy ({kept['skipped']})"})
+        except httpx.HTTPError:
+            pass
+        deny(f"Squidbrake keeps a copy before changes like this one and couldn't ({kept['skipped']}), so it didn't "
+             "run. Tell the user; they can make a backup themselves or set snapshot: best_effort on the rule.")
+    if kept and not kept.get("skipped"):
+        print(json.dumps({"systemMessage": undo.describe(kept)}))
+
+
 def shell_command(ev: dict) -> str | None:
     if commands is None or ev.get("tool_name") not in ("Bash", "PowerShell"):
         return None
@@ -107,6 +205,9 @@ def pre(ev: dict, http: httpx.Client) -> None:
         "metadata": {"cwd": ev.get("cwd"), "permission_mode": ev.get("permission_mode"),
                      "tool_use_id": ev.get("tool_use_id")},
     }
+    spent, usage_state = transcript_usage(ev)
+    if spent:
+        body["metadata"]["usage"] = spent
     if line:
         try:
             if found := effects.predict(line, ev.get("cwd")):
@@ -124,6 +225,9 @@ def pre(ev: dict, http: httpx.Client) -> None:
             raise httpx.HTTPError("the gateway rejected GATEWAY_API_KEY")
         r.raise_for_status()
         d = r.json()
+        save_usage_state(usage_state)
+        if offline is not None:
+            offline.refresh(http, GATEWAY_URL)
         if d["decision"] == "review":
             undo_note = " It can't be undone once it runs." if d.get("cannot_undo") else ""
             print(f"Squidbrake: '{body['name']}' is waiting for approval at {GATEWAY_URL}/dashboard.{undo_note}",
@@ -135,6 +239,13 @@ def pre(ev: dict, http: httpx.Client) -> None:
                 r.raise_for_status()
                 d = r.json()
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:   # not JSON / not our answer: blocked too
+        if offline is not None and isinstance(e, httpx.HTTPError) and "rejected" not in str(e):
+            run, why = offline.decide(GATEWAY_URL, name=body["name"], kind=body["kind"], source=SOURCE,
+                                      session_id=body["session_id"], input=body["input"], fail_open=FAIL_OPEN)
+            if run:
+                print(json.dumps({"systemMessage": f"Squidbrake is unreachable; {why}."}))
+                return
+            deny(unreachable(GATEWAY_URL, e, "tool call") + f" ({why[:1].upper() + why[1:]}.)")
         if FAIL_OPEN:
             return
         deny(unreachable(GATEWAY_URL, e, "tool call"))
@@ -143,7 +254,7 @@ def pre(ev: dict, http: httpx.Client) -> None:
         deny("Squidbrake: nobody approved this in time. Ask the user to approve it in the dashboard, then try again.")
     if d["decision"] == "deny":
         by = d.get("decided_by")
-        if d.get("rule_id") in ("emergency-stop", "session-stop") or                 (d.get("decision_note") or "").startswith("The session was stopped"):
+        if paused(d):
             deny(f"Squidbrake: {d.get('decision_note') or d.get('reason')}. Stop working and tell the user.", stop=True)
         if by == "timeout":
             deny("Squidbrake: nobody approved this in time, so it didn't run. Ask the user to approve it in the "
@@ -157,8 +268,7 @@ def pre(ev: dict, http: httpx.Client) -> None:
     if ev.get("tool_use_id"):
         STATE_DIR.mkdir(exist_ok=True)
         (STATE_DIR / f"{ev['tool_use_id']}.json").write_text(json.dumps({"event_id": d["event_id"], "t0": time.time()}))
-    if line and (kept := undo.snapshot(line, ev.get("cwd"))):
-        print(json.dumps({"systemMessage": undo.describe(kept)}))
+    keep_copy(ev, line, d, http)
 
 
 def post(ev: dict, http: httpx.Client, failed: bool = False) -> None:

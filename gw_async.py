@@ -25,6 +25,11 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+try:
+    import offline   # what to do while the gateway is down (rules.yaml when_unreachable)
+except Exception:  # pragma: no cover
+    offline = None
+
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:8080").rstrip("/")
 GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "")
 SOURCE = os.getenv("GATEWAY_SOURCE", "mcp-agent")
@@ -176,10 +181,19 @@ async def gw_check(name: str, input: Any, kind: str = "tool_call") -> dict:
                                                    "source": source(), "session_id": CURRENT_SESSION.get() or SESSION},
                               headers=_as_caller())
     except httpx.TransportError as e:
+        if offline is not None:      # rules.yaml when_unreachable, from the copy kept while the gateway answered
+            run, why = offline.decide(GATEWAY_URL, name=name, kind=kind, source=source(),
+                                      session_id=CURRENT_SESSION.get() or SESSION, input=input)
+            if run:
+                log(f"Squidbrake is unreachable; {why}")
+                return {"decision": "allow", "event_id": None, "reason": why}
+            raise GatewayError(f"Squidbrake at {GATEWAY_URL} is unreachable ({type(e).__name__}) and {why}")
         raise GatewayError(f"Squidbrake at {GATEWAY_URL} is unreachable ({type(e).__name__}), so nothing was run")
     if r.status_code == 401:
         raise GatewayError("Squidbrake rejected GATEWAY_API_KEY, so nothing was run")
     r.raise_for_status()
+    if offline is not None:
+        await offline.arefresh(http(), GATEWAY_URL)
     return r.json()
 
 
@@ -199,7 +213,9 @@ async def gw_wait(event_id: str, seconds: float) -> dict:
             return d
 
 
-async def gw_result(event_id: str, output: Any = None, error: str | None = None, duration_ms: float | None = None) -> None:
+async def gw_result(event_id: str | None, output: Any = None, error: str | None = None, duration_ms: float | None = None) -> None:
+    if event_id is None:          # ran while the gateway was down: there's no record to attach it to
+        return
     try:
         await http().post(f"/v1/events/{event_id}/result",
                           json={"output": output, "error": error, "duration_ms": duration_ms}, headers=_as_caller())
@@ -248,6 +264,21 @@ async def guard(name: str, input: Any, run: Callable[[], Awaitable[Any]], *,
             return on_text(f"Already handled: another session finished {name} ({eid}). Don't run it again.")
     if d["decision"] == "deny":
         return on_text(denied_text(d))
+    if d.get("snapshot_strict") and eid:
+        # A rule wants a copy kept before this runs, and an MCP tool's change can't be copied from here.
+        why = f"Squidbrake can't keep a copy of what {name} changes over MCP"
+        try:
+            await http().post(f"/v1/events/{eid}/snapshot", json={"skipped": why}, headers=_as_caller())
+        except httpx.HTTPError:
+            pass
+        await gw_result(eid, error=f"not run: no undo copy ({why})")
+        return on_text(f"NOT RUN: the rule for {name} requires an undo copy first, and {why}. Tell the user.")
+    if d.get("snapshot") and eid:   # say so on the record: approved, but with no copy to go back to
+        try:
+            await http().post(f"/v1/events/{eid}/snapshot", headers=_as_caller(),
+                              json={"skipped": "an MCP tool's change can't be copied by Squidbrake (no undo)"})
+        except httpx.HTTPError:
+            pass
     return await on_done(eid, await _timed(run))
 
 

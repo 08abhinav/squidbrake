@@ -41,7 +41,18 @@ def mapping(ev: dict) -> list[dict]:
              f"mode '{p['mode']}'. {p['versions_in_period']} rules versions were in force during the period.")
     stop = f"Emergency stop available for all agents, one agent or one conversation; used {stops} times in the period."
     retention = (f"Records kept {'forever' if not ev['retention_days'] else str(ev['retention_days']) + ' days'}.")
-    return [
+    k = ev.get("controls") or {}
+    signed = (f" {k.get('checkpoints', 0)} signed checkpoints (Ed25519, one per 50 entries) let anyone verify an export "
+              f"against the published ledger key." if k else "")
+    devices = (f" {k.get('device_signed', 0)} decisions were signed by a registered device (passkey: Face ID or "
+               f"fingerprint){'; device signatures are required for approvals' if k.get('device_required') else ''}."
+               if k else "")
+    undo = (f" Before held or irreversible actions run, a copy of what they change is kept ({k.get('snapshots_kept', 0)} "
+            f"kept, {k.get('snapshots_skipped', 0)} could not be made"
+            f"{', and those actions were blocked' if k.get('snapshots') == 'required' else ''})." if k else "")
+    proof = (f" Completed actions were checked in the real system: {k['proofs']['confirmed']} confirmed, "
+             f"{k['proofs']['mismatch']} not actually done." if k.get("proof_checks") else "")
+    rows = [
         {"framework": "SOC 2 (2017 TSC)", "ref": "CC6.1, CC6.3", "requirement": "Logical access; access granted by role",
          "evidence": keys + ". Rules can name who may approve (a person or a role)."},
         {"framework": "SOC 2 (2017 TSC)", "ref": "CC7.2", "requirement": "Monitor system components for anomalies",
@@ -62,6 +73,23 @@ def mapping(ev: dict) -> list[dict]:
         {"framework": "RBI FREE-AI (2025, guidance)", "ref": "Audit and oversight recommendations",
          "requirement": "Audit trails and human oversight of AI decisions", "evidence": logging + " " + oversight},
     ]
+    if k:
+        rows += [
+            {"framework": "SOC 2 (2017 TSC)", "ref": "CC7.4, CC7.5", "requirement": "Respond to and recover from incidents",
+             "evidence": (stop + undo + proof).strip()},
+            {"framework": "SOC 2 (2017 TSC)", "ref": "CC6.7, C1.1", "requirement": "Protect confidential information",
+             "evidence": f"Stored action details: {k.get('redaction')}; long values are cut to a preview where shown."},
+            {"framework": "ISO/IEC 42001", "ref": "Annex A, AI system records and responsible use",
+             "requirement": "Records are protected from tampering and decisions are attributable",
+             "evidence": (logging + signed + devices).strip()},
+            {"framework": "EU AI Act", "ref": "Art. 14(4)", "requirement": "Overseers can decide not to use, override or "
+             "reverse the output, and interrupt the system", "evidence": (oversight + " " + stop + undo).strip()},
+            {"framework": "EU AI Act", "ref": "Art. 15", "requirement": "Accuracy, robustness, resilience to faults",
+             "evidence": f"When Squidbrake is unreachable, actions are {'blocked' if k.get('when_unreachable') == 'block' else 'allowed'} "
+                         f"by default; {k.get('allow_while_unreachable', 0)} rule(s) explicitly allow their actions while it's "
+                         f"down.{proof}"},
+        ]
+    return rows
 
 
 def _table(head: list[str], rows: list[list], empty: str = "None in this period.") -> str:
@@ -119,7 +147,19 @@ It needs no access to this system.</p>
     ["Rules fingerprint now", p["fingerprint"]],
     ["Second-person approval", "on: nobody approves their own agent's request" if sp["enforced"] else "off"],
     ["People and agents", f"{t['people']} people ({_n(t['approvers'], 'approver')}, {_n(t['admins'], 'admin')}); {_n(t['agents'], 'agent')}, {t['agents_with_owner']} with an owner"],
-    ["When Squidbrake is unreachable", "agent hooks block the action (fail closed) unless GATEWAY_FAIL_OPEN is set on that machine"],
+    ["When Squidbrake is unreachable", (f"each rule decides; default {ev['controls']['when_unreachable']}, "
+                                        f"{ev['controls']['allow_while_unreachable']} rule(s) allow while it's down"
+                                        if ev.get("controls") else "agent hooks block the action (fail closed)")
+                                       + " (GATEWAY_FAIL_OPEN on a machine overrides it there)"],
+    *([["Undo copies before risky actions", f"{ev['controls']['snapshots']}: {ev['controls']['snapshots_kept']} kept, "
+                                             f"{ev['controls']['snapshots_skipped']} not possible"],
+       ["Signed checkpoints", f"{ev['controls']['checkpoints']}; ledger key {ev['controls']['ledger_key'][:16]}…"],
+       ["Approvals signed by a device", f"{ev['controls']['device_signed']} in the period, {ev['controls']['devices']} devices "
+                                        f"registered{', required' if ev['controls']['device_required'] else ''}"],
+       ["Spend limits", f"{ev['controls']['budgets']} budget(s)"],
+       ["Proof of work", f"{ev['controls']['proof_checks']} check(s): {ev['controls']['proofs']['confirmed']} confirmed, "
+                         f"{ev['controls']['proofs']['mismatch']} mismatched"],
+       ["Stored data", ev["controls"]["redaction"]]] if ev.get("controls") else []),
     ["Record retention", "forever" if not ev["retention_days"] else f"{ev['retention_days']} days"],
 ])}
 

@@ -7,3 +7,6 @@ os.environ["SQUIDBRAKE_HOOKLOG"] = os.path.join(tempfile.mkdtemp(prefix="squidbr
 
 # Never ask about or send usage stats from the tests.
 os.environ["SQUIDBRAKE_TELEMETRY"] = "0"
+
+# The hooks keep a copy of the rules' offline settings (offline.py): in a temporary folder, never the real ~/.squidbrake.
+os.environ["SQUIDBRAKE_OFFLINE_DIR"] = tempfile.mkdtemp(prefix="squidbrake-offline-")

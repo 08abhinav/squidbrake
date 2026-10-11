@@ -37,6 +37,10 @@ try:
     import hooklog   # which agent ran the hook and when, for `squidbrake doctor`
 except Exception:  # pragma: no cover
     hooklog = None
+try:
+    import offline   # what to do while the gateway is down (rules.yaml when_unreachable)
+except Exception:  # pragma: no cover
+    offline = None
 
 AGENTS = ("cursor", "gemini-cli", "codex", "vscode", "antigravity")
 
@@ -224,21 +228,41 @@ def check(agent: str, name: str, inp: dict, session: str | None) -> None:
                 r = http.get(f"/v1/events/{d['event_id']}/decision", params={"wait": wait}, timeout=wait + 10)
                 r.raise_for_status()
                 d = r.json()
+            if offline is not None:
+                offline.refresh(http, URL)
             if d["decision"] == "allow":
+                kept = undo.snapshot(line, cwd) if line and undo is not None else None
+                if kept is None and d.get("snapshot_strict"):
+                    kept = {"skipped": f"Squidbrake can't keep a copy of what {name} changes from {agent}"}
+                if d.get("snapshot") and kept is not None:
+                    http.post(f"/v1/events/{d['event_id']}/snapshot", json={"skipped": kept["skipped"]}
+                              if kept.get("skipped") else {"kind": "local", "ref": kept["id"], "summary": undo.describe(kept)})
+                if kept and kept.get("skipped") and d.get("snapshot") == "required":
+                    http.post(f"/v1/events/{d['event_id']}/result", json={"error": f"not run: no undo copy ({kept['skipped']})"})
+                    answer(agent, False, f"Squidbrake keeps a copy before changes like this one and couldn't "
+                                         f"({kept['skipped']}), so it didn't run. Tell the user.")
+                if kept and not kept.get("skipped"):
+                    print(undo.describe(kept), file=sys.stderr)
                 # these agents don't report results back: mark the call done so it isn't left "pending"
                 http.post(f"/v1/events/{d['event_id']}/result", json={"output": {"result": f"not reported by {agent}"}})
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:   # not JSON / not our answer: blocked too
+        if offline is not None and isinstance(e, httpx.HTTPError) and "rejected" not in str(e):
+            run, why = offline.decide(URL, name=name, kind="agent_hook", source=agent, session_id=session, input=inp,
+                                      fail_open=FAIL_OPEN)
+            if run:
+                print(f"Squidbrake is unreachable; {why}.", file=sys.stderr)
+                answer(agent, True)
+            answer(agent, False, unreachable(URL, e) + f" ({why[:1].upper() + why[1:]}.)")
         if FAIL_OPEN:
             answer(agent, True)
         answer(agent, False, unreachable(URL, e))
     if d["decision"] == "allow":
-        if line and (kept := undo.snapshot(line, cwd)):
-            print(undo.describe(kept), file=sys.stderr)
         answer(agent, True)
     if d["decision"] == "review":
         answer(agent, False, "Squidbrake: nobody approved this in time. Ask the user to approve it in the dashboard, then try again.")
     by, note = d.get("decided_by"), d.get("decision_note")
-    if d.get("rule_id") in ("emergency-stop", "session-stop") or (note or "").startswith("The session was stopped"):
+    if d.get("rule_id") in ("emergency-stop", "session-stop") or str(d.get("rule_id") or "").startswith("budget:") \
+            or (note or "").startswith("The session was stopped"):
         answer(agent, False, f"Squidbrake: {note or d.get('reason')}. Stop working and tell the user.", stop=True)
     if by == "timeout":
         answer(agent, False, "Squidbrake: nobody approved this in time, so it didn't run. Ask the user to approve it in "

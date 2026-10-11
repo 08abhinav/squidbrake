@@ -15,6 +15,11 @@ Python client for Squidbrake. Drop this file into any agent / service.
 
     gw.log("deploy", input={"env": "prod"}, output="ok", kind="action")   # record-only
 
+    @gw.guard(snapshot=lambda args: db.get_order(args["order_id"]))   # undo: keep the record before it changes
+    def update_order(order_id: str, status: str): ...
+
+    gw.usage(model="claude-opus-5-5", input_tokens=1200, output_tokens=300)   # for rules.yaml `budgets:`
+
 Calls matched by a `review` rule block inside check() / the decorator until a human approves
 (the tool then runs) or rejects / the approval times out (Denied is raised).
 """
@@ -29,6 +34,11 @@ import time
 from typing import Any, Callable
 
 import httpx
+
+try:  # what to do while the gateway is down (rules.yaml when_unreachable); optional when this file is copied alone
+    import offline
+except Exception:  # pragma: no cover
+    offline = None
 
 log = logging.getLogger("gateway.client")
 LONG_POLL = 25.0  # seconds per /decision request while waiting for a human
@@ -90,10 +100,17 @@ class Gateway:
         return {"name": name, "kind": kind, "input": input, "source": self.source,
                 "session_id": self.session_id, "metadata": metadata or {}, **extra}
 
-    def _first(self, name: str, resp: httpx.Response | None) -> dict | None:
+    def _first(self, name: str, resp: httpx.Response | None, input: Any = None, kind: str = "tool_call") -> dict | None:
         if resp is None:
             if self.fail_open:
                 return None
+            if offline is not None:
+                run, why = offline.decide(self.url, name=name, kind=kind, source=self.source,
+                                          session_id=self.session_id, input=input)
+                if run:
+                    log.warning("Squidbrake unreachable; '%s' ran unrecorded: %s", name, why)
+                    return None
+                raise GatewayUnavailable(f"gateway unreachable, refusing to run '{name}': {why}")
             raise GatewayUnavailable(f"gateway unreachable, refusing to run '{name}'")
         resp.raise_for_status()
         d = resp.json()
@@ -117,13 +134,72 @@ class Gateway:
         return (datetime.now(timezone.utc) - deadline).total_seconds() > 60
 
     # ---- sync API
-    def check(self, name: str, input: Any = None, *, kind: str = "tool_call", metadata: dict | None = None) -> str | None:
-        """Ask before running. Returns event_id; raises Denied if blocked. Waits while a human reviews it."""
+    def _snapshot_body(self, name: str, d: dict, input: Any, snapshot: Callable | None) -> dict | None:
+        """What to tell the gateway about the undo copy for this call (None: no copy wanted / possible)."""
+        if not d.get("snapshot"):
+            return None
+        if snapshot is None:
+            return {"skipped": f"no snapshot function was given for {name}"} if d.get("snapshot_strict") else None
+        try:
+            data = snapshot(input)
+        except Exception as e:
+            return {"skipped": f"the snapshot function failed ({type(e).__name__}: {e})"}
+        return {"kind": "data", "summary": f"{name}: the record before the change", "data": data}
+
+    def _after_snapshot(self, name: str, d: dict, body: dict | None, posted: bool) -> None:
+        if body and body.get("skipped") and d.get("snapshot") == "required":
+            raise Denied(name, f"no undo copy could be made ({body['skipped']}), so it didn't run", d["event_id"])
+        if body and not body.get("skipped") and not posted and d.get("snapshot") == "required":
+            raise Denied(name, "the undo copy couldn't be saved on the gateway, so it didn't run", d["event_id"])
+
+    def _keep(self, name: str, d: dict | None, input: Any, snapshot: Callable | None) -> None:
+        if d is None or d.get("decision") != "allow":
+            return
+        body = self._snapshot_body(name, d, input, snapshot)
+        posted = False
+        if body:
+            try:
+                posted = self._http.post(f"/v1/events/{d['event_id']}/snapshot", json=body).status_code == 200
+            except httpx.TransportError:
+                pass
+            if (body.get("skipped") or not posted) and d.get("snapshot") == "required":
+                self.result(d["event_id"], error=f"not run: no undo copy ({body.get('skipped') or 'not saved'})")
+        self._after_snapshot(name, d, body, posted)
+
+    async def _akeep(self, name: str, d: dict | None, input: Any, snapshot: Callable | None) -> None:
+        if d is None or d.get("decision") != "allow":
+            return
+        body = self._snapshot_body(name, d, input, snapshot)
+        posted = False
+        if body:
+            try:
+                posted = (await self._ahttp().post(f"/v1/events/{d['event_id']}/snapshot", json=body)).status_code == 200
+            except httpx.TransportError:
+                pass
+            if (body.get("skipped") or not posted) and d.get("snapshot") == "required":
+                await self.aresult(d["event_id"], error=f"not run: no undo copy ({body.get('skipped') or 'not saved'})")
+        self._after_snapshot(name, d, body, posted)
+
+    def usage(self, *, model: str | None = None, input_tokens: int = 0, output_tokens: int = 0,
+              cost_usd: float | None = None) -> dict | None:
+        """Report model tokens this agent spent, for rules.yaml `budgets:`. Never raises."""
+        try:
+            return self._http.post("/v1/usage", json={"source": self.source, "session_id": self.session_id,
+                                                       "model": model, "input_tokens": input_tokens,
+                                                       "output_tokens": output_tokens, "cost_usd": cost_usd}).json()
+        except (httpx.HTTPError, ValueError):
+            return None
+
+    def check(self, name: str, input: Any = None, *, kind: str = "tool_call", metadata: dict | None = None,
+              snapshot: Callable[[Any], Any] | None = None) -> str | None:
+        """Ask before running. Returns event_id; raises Denied if blocked. Waits while a human reviews it.
+        snapshot(input) returns the record as it is now; when the rules want an undo copy it's kept on the gateway
+        before the call runs, and if it fails where a copy is required, the call doesn't run (Denied)."""
         try:
             resp = self._http.post("/v1/events", json=self._event(name, input, kind, metadata))
         except httpx.TransportError:
             resp = None
-        d = self._first(name, resp)
+        d = self._first(name, resp, input, kind)
         while d is not None and d["decision"] == "review":
             try:
                 r = self._http.get(f"/v1/events/{d['event_id']}/decision",
@@ -134,7 +210,9 @@ class Gateway:
                 if self._gave_up(d):
                     raise GatewayUnavailable(f"lost the gateway while '{name}' awaited approval")
                 time.sleep(2)
-        return self._final(name, d)
+        eid = self._final(name, d)
+        self._keep(name, d, input, snapshot)
+        return eid
 
     def result(self, event_id: str | None, *, output: Any = None, error: str | None = None,
                duration_ms: float | None = None) -> None:
@@ -153,12 +231,13 @@ class Gateway:
             name, input, kind, metadata, output=output, error=error, duration_ms=duration_ms)).json()
 
     # ---- async API
-    async def acheck(self, name: str, input: Any = None, *, kind: str = "tool_call", metadata: dict | None = None) -> str | None:
+    async def acheck(self, name: str, input: Any = None, *, kind: str = "tool_call", metadata: dict | None = None,
+                     snapshot: Callable[[Any], Any] | None = None) -> str | None:
         try:
             resp = await self._ahttp().post("/v1/events", json=self._event(name, input, kind, metadata))
         except httpx.TransportError:
             resp = None
-        d = self._first(name, resp)
+        d = self._first(name, resp, input, kind)
         while d is not None and d["decision"] == "review":
             try:
                 r = await self._ahttp().get(f"/v1/events/{d['event_id']}/decision",
@@ -169,7 +248,9 @@ class Gateway:
                 if self._gave_up(d):
                     raise GatewayUnavailable(f"lost the gateway while '{name}' awaited approval")
                 await asyncio.sleep(2)
-        return self._final(name, d)
+        eid = self._final(name, d)
+        await self._akeep(name, d, input, snapshot)
+        return eid
 
     async def aresult(self, event_id: str | None, *, output: Any = None, error: str | None = None,
                       duration_ms: float | None = None) -> None:
@@ -182,7 +263,7 @@ class Gateway:
             pass
 
     # ---- decorator
-    def guard(self, name: str | None = None, *, kind: str = "tool_call"):
+    def guard(self, name: str | None = None, *, kind: str = "tool_call", snapshot: Callable[[dict], Any] | None = None):
         def deco(fn: Callable):
             tool = name or fn.__name__
             sig = inspect.signature(fn)
@@ -194,7 +275,7 @@ class Gateway:
             if inspect.iscoroutinefunction(fn):
                 @functools.wraps(fn)
                 async def awrapper(*a, **kw):
-                    eid = await self.acheck(tool, args_of(a, kw), kind=kind)
+                    eid = await self.acheck(tool, args_of(a, kw), kind=kind, snapshot=snapshot)
                     t0 = time.perf_counter()
                     try:
                         out = await fn(*a, **kw)
@@ -207,7 +288,7 @@ class Gateway:
 
             @functools.wraps(fn)
             def wrapper(*a, **kw):
-                eid = self.check(tool, args_of(a, kw), kind=kind)
+                eid = self.check(tool, args_of(a, kw), kind=kind, snapshot=snapshot)
                 t0 = time.perf_counter()
                 try:
                     out = fn(*a, **kw)

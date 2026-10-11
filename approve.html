@@ -74,6 +74,11 @@ a { color: var(--accent); }
 .signal { border-radius: 10px; padding: 10px 12px; font-size: 14px; margin-bottom: 10px; background: var(--soft);
           border: 1px solid var(--border); border-left: 5px solid var(--warn); }
 .signal.block { border-left-color: var(--bad); }
+.brief { border-radius: 10px; padding: 10px 12px; font-size: 14px; margin-bottom: 10px; background: var(--soft);
+         border: 1px solid var(--border); border-left: 5px solid var(--accent); white-space: pre-wrap; }
+.brief small { display: block; color: var(--muted); margin-top: 4px; }
+.ghost { width: 100%; margin-top: 10px; background: transparent; color: var(--bad); border-color: var(--bad); min-height: 44px; }
+.faceid { width: 100%; margin-top: 10px; min-height: 44px; }
 .story-d { margin: 0 0 12px; }
 .story-d summary { cursor: pointer; color: var(--accent); font-size: 15px; padding: 4px 0; }
 .story { list-style: none; margin: 8px 0 0; padding: 0 0 0 14px; border-left: 2px solid var(--border); }
@@ -135,6 +140,42 @@ a { color: var(--accent); }
     return data;
   }
   const pad = (n) => String(n).padStart(2, "0");
+
+  // ---- passkeys: Face ID / fingerprint signs the decision itself
+  const fromB64u = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), (c) => c.charCodeAt(0));
+  const toB64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const passkeysWork = () => !!(window.PublicKeyCredential && navigator.credentials && window.isSecureContext);
+  // challengePath gives what to sign; returns the proof, or null when there's no device to sign with.
+  async function sign(challengePath, outcome) {
+    if (!passkeysWork()) return null;
+    const ch = await call("POST", challengePath, { outcome });
+    if (!ch.allow_credentials.length) {
+      if (ch.required && outcome === "approve") throw new Error("Approvals need Face ID or fingerprint, and this person has no device set up yet. Set one up first (button below, signed in with your key).");
+      return null;
+    }
+    const cred = await navigator.credentials.get({ publicKey: { challenge: fromB64u(ch.challenge), rpId: ch.rp_id,
+      userVerification: "required", timeout: 60000, allowCredentials: ch.allow_credentials.map((id) => ({ type: "public-key", id: fromB64u(id) })) } });
+    return { credential_id: toB64u(cred.rawId), statement: ch.statement, authenticator_data: toB64u(cred.response.authenticatorData),
+             client_data_json: toB64u(cred.response.clientDataJSON), signature: toB64u(cred.response.signature) };
+  }
+  async function registerDevice() {
+    const name = prompt("Name this device:", /iPhone|iPad|Android|Mac|Windows/.exec(navigator.userAgent)?.[0] || "My phone");
+    if (!name) return;
+    try {
+      const o = await call("POST", "/v1/devices/register/start");
+      const cred = await navigator.credentials.create({ publicKey: { ...o, challenge: fromB64u(o.challenge),
+        user: { ...o.user, id: fromB64u(o.user.id) }, excludeCredentials: o.excludeCredentials.map((c) => ({ ...c, id: fromB64u(c.id) })) } });
+      await call("POST", "/v1/devices/register/finish", { name: name.trim(), challenge: o.challenge, credential_id: toB64u(cred.rawId),
+        client_data_json: toB64u(cred.response.clientDataJSON), attestation_object: toB64u(cred.response.attestationObject) });
+      alert("Done. Your approvals from this device are now signed with Face ID / fingerprint.");
+      inbox();
+    } catch (err) { if (err.name !== "NotAllowedError") alert(err.message); }
+  }
+  function briefEl(e) {
+    if (!e.brief || !e.brief.text) return null;
+    return el("div", { class: "brief" }, el("b", { text: "AI brief: " }), e.brief.text,
+      el("small", { text: "Advice only. The rules held it; you decide." }));
+  }
   function when(iso) { return iso ? new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—"; }
   function ago(iso) {
     const s = Math.max(0, Math.round((Date.now() - new Date(iso)) / 1000));
@@ -198,7 +239,7 @@ a { color: var(--accent); }
   }
 
   // One request, one card, two big buttons.
-  function card(e, decideFn) {
+  function card(e, decideFn, stopFn) {
     const done = outcome(e);
     const note = el("textarea", { placeholder: "Note (optional) — the agent sees it", maxlength: "2000", "aria-label": "Note" });
     const go = (what) => async (ev) => {
@@ -209,7 +250,7 @@ a { color: var(--accent); }
       try {
         const d = await decideFn(what, note.value.trim() || null);
         e.status = d.status; e.decision = d.decision; e.decided_by = d.decided_by; e.decided_at = new Date().toISOString(); e.decision_note = d.decision_note;
-        c.replaceWith(card(e, decideFn));
+        c.replaceWith(card(e, decideFn, stopFn));
       } catch (err) {
         btns.forEach((b) => (b.disabled = false));
         alert(err.message);
@@ -219,6 +260,7 @@ a { color: var(--accent); }
       el("div", { class: "kicker", text: done ? "Request" : "Needs your decision" }),
       el("h2", {}, e.source || e.client, " wants to run ", el("code", { text: e.name })),
       el("div", { class: "why", text: (e.reason || "") + (e.rule_id ? ` (rule: ${e.rule_id})` : "") }),
+      briefEl(e),
       signalsEl(e.signals),
       storyBox(e),
       el("dl", { class: "meta" },
@@ -232,6 +274,12 @@ a { color: var(--accent); }
         el("div", { class: "acts" },
           el("button", { class: "reject", onclick: go("reject") }, "✕ Reject"),
           el("button", { class: "approve", onclick: go("approve") }, "✓ Approve")),
+        stopFn ? el("button", { class: "ghost", onclick: async (ev) => {
+          const who = e.source || e.client;
+          if (!confirm(`Stop ${who} now? Everything it tries is blocked until an admin resumes it.`)) return;
+          ev.target.disabled = true;
+          try { await stopFn(); ev.target.textContent = `⏹ ${who} is stopped`; } catch (err) { ev.target.disabled = false; alert(err.message); }
+        } }, `⏹ Stop ${e.source || e.client}`) : null,
       ]);
     return c;
   }
@@ -241,7 +289,8 @@ a { color: var(--accent); }
     try {
       const e = await call("GET", `/v1/a/${token}`);
       $("#who").textContent = `deciding as ${e.approver}`; $("#who").hidden = false;
-      root.replaceChildren(card(e, (what, note) => call("POST", `/v1/a/${token}/${what}`, { note })));
+      root.replaceChildren(card(e, async (what, note) => call("POST", `/v1/a/${token}/${what}`,
+        { note, device_proof: await sign(`/v1/a/${token}/challenge`, what) }), () => call("POST", `/v1/a/${token}/stop`, {})));
       $("#foot").textContent = "This link works for this one request only.";
       tick();
     } catch (err) {
@@ -271,7 +320,8 @@ a { color: var(--accent); }
       ]);
       renderStop(controls);
       const items = list.events.sort((a, b) => (a.approval_deadline || "").localeCompare(b.approval_deadline || ""));
-      const decideFn = (id) => (what, note) => call("POST", `/v1/events/${id}/${what}`, { note });
+      const decideFn = (id) => async (what, note) => call("POST", `/v1/events/${id}/${what}`,
+        { note, device_proof: me.can_approve ? await sign(`/v1/events/${id}/challenge`, what) : null });
       const typing = document.activeElement && document.activeElement.tagName === "TEXTAREA";
       if (!typing) {
         root.replaceChildren(...(items.length ? items.map((e) => card(e, decideFn(e.id))) :
@@ -279,6 +329,11 @@ a { color: var(--accent); }
       }
       document.title = items.length ? `(${items.length}) Approvals` : "Approvals";
       $("#foot").textContent = me.can_approve ? "Updates every few seconds." : `“${me.client}” can view but not approve.`;
+      if (me.can_approve && passkeysWork() && !$("#faceBtn")) {
+        const devs = await call("GET", "/v1/devices").catch(() => ({ devices: [] }));
+        if (!devs.devices.some((d) => d.person === me.client))
+          $("#foot").after(el("button", { id: "faceBtn", class: "faceid", onclick: registerDevice }, "🔒 Set up Face ID / fingerprint for approvals"));
+      }
       tick();
     } catch (err) {
       if (err.status === 401) { key = ""; try { localStorage.removeItem("gw.key"); } catch {} askKey("That key was rejected. Try again."); }

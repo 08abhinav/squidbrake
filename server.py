@@ -70,6 +70,7 @@ import pilot
 import policy_edit
 import risk
 import siem
+import signing
 import taint
 import verify
 
@@ -206,8 +207,9 @@ class KeyStore:
             self._by_hash = {_hash(s): n for s, n in _parse_api_keys(env_keys).items()}
             self.approvers = {n.strip() for n in env_approvers.split(",") if n.strip()}
             # Env-configured keys predate teams: everyone may view, approvers are admins.
-            self._info = {n: {"kind": "person", "approver": n in self.approvers,
-                              "roles": ["admin"] if n in self.approvers else []} for n in self._by_hash.values()}
+            self._info = {n: self._normalize(n, {"kind": "person", "approver": n in self.approvers,
+                                                 "roles": ["admin"] if n in self.approvers else []})
+                          for n in self._by_hash.values()}
 
     @staticmethod
     def _normalize(name: str, k: dict) -> dict:
@@ -215,8 +217,11 @@ class KeyStore:
         roles = k.get("roles")
         if roles is None:  # keys.json from before teams existed
             roles = ["admin"] if name == "admin" and approver else []
-        return {"kind": k.get("kind") or ("person" if approver else "agent"), "approver": approver,
-                "roles": list(roles), "owner": k.get("owner"), "created_at": k.get("created_at")}
+        roles = list(roles)
+        kind = k.get("kind") or ("person" if approver else "agent")
+        access = "agent" if kind == "agent" else "owner" if "owner" in roles else "admin" if "admin" in roles             else "approver" if approver else "viewer"
+        return {"kind": kind, "approver": approver,
+                "roles": roles, "owner": k.get("owner"), "created_at": k.get("created_at"), "access": access}
 
     @property
     def enabled(self) -> bool:
@@ -256,15 +261,32 @@ class KeyStore:
 
     def info(self, name: str) -> dict:
         if self.disabled:
-            return {"kind": "person", "approver": True, "roles": ["admin"], "created_at": None}
+            return {"kind": "person", "approver": True, "roles": ["admin"], "created_at": None, "access": "owner"}
         self._maybe_reload()
-        return self._info.get(name) or {"kind": "agent", "approver": False, "roles": [], "created_at": None}
+        return self._info.get(name) or {"kind": "agent", "approver": False, "roles": [], "created_at": None,
+                                        "access": "agent"}
 
     def is_person(self, name: str) -> bool:
         return self.info(name)["kind"] == "person"
 
     def is_admin(self, name: str) -> bool:
-        return "admin" in self.info(name)["roles"]
+        roles = self.info(name)["roles"]
+        return "admin" in roles or "owner" in roles
+
+    def is_owner(self, name: str) -> bool:
+        """Owners manage who is an admin or owner. A team that never named one (keys from before roles had levels)
+        treats its admins as owners."""
+        if "owner" in self.info(name)["roles"]:
+            return True
+        return self.is_admin(name) and not any("owner" in i["roles"] for i in self._all_info().values())
+
+    def _all_info(self) -> dict[str, dict]:
+        self._maybe_reload()
+        return self._info
+
+    def access(self, name: str) -> str:
+        """owner > admin > approver > viewer for people; agents only ask and report."""
+        return self.info(name)["access"]
 
     def matches(self, name: str, allowed: list[str]) -> bool:
         """Rule `approvers:` entries are key names or `role:NAME`."""
@@ -377,7 +399,7 @@ class KeyStore:
         now = utcnow()
         data = {"keys": {
             "admin": {"sha256": _hash(created["admin"]), "kind": "person", "approver": True,
-                      "roles": ["admin"], "created_at": now},
+                      "roles": ["owner", "admin"], "created_at": now},
             "agent": {"sha256": _hash(created["agent"]), "kind": "agent", "approver": False,
                       "roles": [], "created_at": now},
         }}
@@ -440,6 +462,11 @@ events = Table(
     Column("would", String(10)),                    # shadow mode: what would have happened (deny | review), then allowed
     Column("risk", Integer),                        # risk.py's 0..100 score: recorded, never used to decide
     Column("risk_why", Text),                       # JSON list of what made the score
+    Column("snapshot", Text),                       # JSON: the copy kept before it ran ({kind, ref, summary}), or why not
+    Column("proof_status", String(20)),             # did the change really happen? confirmed | mismatch | error
+    Column("proof", Text),                          # JSON: what was checked, where, and what it found (proof.py)
+    Column("brief", Text),                          # JSON: the AI approval brief {text, model, at} (advice only)
+    Column("decided_with", String(200)),            # how the person decided, e.g. "passkey: Pat's iPhone"
 )
 
 # Small key/value store for state all workers share: the emergency stop and notification settings.
@@ -463,6 +490,57 @@ audit_trail = Table(
     Column("hash", String(64), nullable=False),
 )
 GENESIS = verify.GENESIS
+
+# Every CHECKPOINT_EVERY entries the chain's fingerprint is signed with the ledger key (signing.py), whose public half
+# is published at /v1/audit/public-key: an export can then be proven unedited by anyone, without trusting this server.
+audit_checkpoints = Table(
+    "audit_checkpoints", metadata,
+    Column("seq", Integer, primary_key=True),       # the audit entry the checkpoint covers (inclusive)
+    Column("at", String(32), nullable=False),
+    Column("head_hash", String(64), nullable=False),
+    Column("key_id", String(16), nullable=False),
+    Column("signature", String(128), nullable=False),  # Ed25519, hex
+)
+
+# A copy of what an approved action was about to change, taken right before it ran (see /v1/events/{id}/snapshot):
+# a file backup on the agent's computer (squidbrake undo ID), or the record itself (an API resource, a row).
+snapshots = Table(
+    "snapshots", metadata,
+    Column("id", String(36), primary_key=True),
+    Column("event_id", String(36), nullable=False, index=True),
+    Column("created_at", String(32), nullable=False),
+    Column("kind", String(30), nullable=False),     # local | http | data
+    Column("ref", String(300)),                     # local: the backup id on that computer; http: the URL read
+    Column("summary", Text),
+    Column("data", Text),                           # the saved copy (redacted like everything stored)
+    Column("sha256", String(64)),
+)
+
+# Model tokens and money spent, reported by agents (see /v1/usage and rules.yaml `budgets:`).
+usage = Table(
+    "usage", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("at", String(32), nullable=False, index=True),
+    Column("client", String(200), index=True),
+    Column("source", String(200), index=True),
+    Column("session_id", String(200)),
+    Column("model", String(100)),
+    Column("input_tokens", Integer),
+    Column("output_tokens", Integer),
+    Column("cost_usd", Float),
+)
+
+# Phones and laptops that sign approvals with a passkey (Face ID, fingerprint): WebAuthn credentials.
+devices = Table(
+    "devices", metadata,
+    Column("credential_id", String(400), primary_key=True),   # base64url
+    Column("person", String(200), nullable=False, index=True),
+    Column("name", String(100)),
+    Column("created_at", String(32), nullable=False),
+    Column("public_key", Text, nullable=False),               # JSON {"x": hex, "y": hex} (P-256)
+    Column("sign_count", Integer),
+    Column("last_used_at", String(32)),
+)
 
 # Every version of rules.yaml that made a decision, so any decision can be traced to the exact rules behind it.
 policy_versions = Table(
@@ -518,22 +596,89 @@ def audit(conn, actor: str | None, action: str, target: str | None, **detail) ->
     """Append to the hash chain inside the caller's audited_tx()."""
     prev = conn.execute(select(audit_trail.c.hash).order_by(audit_trail.c.seq.desc()).limit(1)).scalar() or GENESIS
     at, d = utcnow(), json.dumps(detail, sort_keys=True, default=str, ensure_ascii=False)
-    conn.execute(audit_trail.insert().values(at=at, actor=actor, action=action, target=target, detail=d,
-                                             prev_hash=prev, hash=_entry_hash(prev, at, actor, action, target, d)))
+    h = _entry_hash(prev, at, actor, action, target, d)
+    seq = conn.execute(audit_trail.insert().values(at=at, actor=actor, action=action, target=target, detail=d,
+                                                   prev_hash=prev, hash=h)).inserted_primary_key[0]
+    if seq and seq % signing.CHECKPOINT_EVERY == 0:
+        _sign_checkpoint(conn, seq, h)
+
+
+# --------------------------------------------------------------------------- signed checkpoints (the ledger key)
+
+_ledger_cache: bytes | None = None
+
+
+def ledger_secret() -> bytes:
+    """The Ed25519 key that signs checkpoints: SQUIDBRAKE_LEDGER_KEY (64 hex characters), else data/ledger.key, made
+    once. Keep a copy somewhere safe: a new key can't sign the old checkpoints, so publish each public key you use."""
+    global _ledger_cache
+    if _ledger_cache is None:
+        if env := os.getenv("SQUIDBRAKE_LEDGER_KEY", "").strip():
+            _ledger_cache = bytes.fromhex(env)
+        else:
+            path = KEYS_PATH.parent / "ledger.key"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(signing.new_secret().hex())
+            except FileExistsError:
+                pass
+            _ledger_cache = bytes.fromhex(path.read_text().strip())
+        if len(_ledger_cache) != 32:
+            raise ValueError("the ledger key must be 32 bytes (64 hex characters)")
+    return _ledger_cache
+
+
+def ledger_public() -> dict:
+    pub = signing.ed25519_public_key(ledger_secret())
+    return {"algorithm": "ed25519", "public_key": pub.hex(), "key_id": hashlib.sha256(pub).hexdigest()[:16],
+            "every": signing.CHECKPOINT_EVERY, "format": signing.CHECKPOINT_FORMAT,
+            "message": f"{signing.CHECKPOINT_FORMAT}|<seq>|<hash of entry seq>"}
+
+
+def _sign_checkpoint(conn, seq: int, head_hash: str) -> None:
+    key = ledger_public()
+    sig = signing.ed25519_sign(ledger_secret(), signing.checkpoint_message(seq, head_hash)).hex()
+    conn.execute(audit_checkpoints.insert().values(seq=seq, at=utcnow(), head_hash=head_hash, key_id=key["key_id"],
+                                                   signature=sig))
+
+
+def sign_missing_checkpoints() -> int:
+    """At start: a chain from before checkpoints existed gets them now (they attest the history as of today)."""
+    every = signing.CHECKPOINT_EVERY
+    with audited_tx() as conn:
+        have = {r[0] for r in conn.execute(select(audit_checkpoints.c.seq)).all()}
+        due = conn.execute(select(audit_trail.c.seq, audit_trail.c.hash).where(
+            text(f"seq % {every} = 0")).order_by(audit_trail.c.seq)).all()
+        missing = [(s, h) for s, h in due if s not in have]
+        for s, h in missing:
+            _sign_checkpoint(conn, s, h)
+    return len(missing)
+
+
+def checkpoint_rows(conn) -> list[dict]:
+    return [dict(r._mapping) for r in conn.execute(select(audit_checkpoints).order_by(audit_checkpoints.c.seq)).all()]
 
 
 def verify_audit_chain() -> dict:
-    """The hash chain, plus: do the recorded actions still match the fingerprints taken when they happened?"""
+    """The hash chain, plus: do the recorded actions still match the fingerprints taken when they happened? And is
+    every signed checkpoint still a valid signature over the chain as it is now?"""
     with engine.connect() as conn:
         entries = [dict(r._mapping) for r in conn.execute(select(audit_trail).order_by(audit_trail.c.seq)).all()]
         rows = {r.id: {"id": r.id, "input": r.input, "output": r.output}
                 for r in conn.execute(select(events.c.id, events.c.input, events.c.output)).all()}
+        cps = checkpoint_rows(conn)
     result = verify.check_chain(entries)
     changed = verify.check_events(entries, rows)["changed"] if result["ok"] else []
     if changed:
         result.update(ok=False, head_hash=result["head_hash"], events_changed=changed,
                       message=f"the chain is intact, but {len(changed)} recorded action(s) were edited in the database "
                               f"afterwards (first: {changed[0]['event']}, {changed[0]['field']})")
+    signed = verify.check_checkpoints(entries, cps, ledger_public()["public_key"])
+    result["checkpoints"] = signed
+    if not signed["ok"] and result["ok"]:
+        result.update(ok=False, message=signed["message"])
     return result
 
 
@@ -570,14 +715,49 @@ SECRET_VALUE_RE = re.compile(
 )
 
 
+# People's details in stored actions: an email keeps its first letter and its domain (the domain is what look-alike and
+# untrusted-destination checks need) plus a short fingerprint, so the same address always masks the same way and
+# "the same customer again" is still seen. A card number keeps its last four digits. SQUIDBRAKE_REDACT_PERSONAL=0: off.
+REDACT_PERSONAL = os.getenv("SQUIDBRAKE_REDACT_PERSONAL", "1").lower() not in ("0", "false", "no", "off")
+EMAIL_VALUE_RE = re.compile(r"\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})\b")
+CARD_VALUE_RE = re.compile(r"(?<![\d-])[2-6](?:[ -]?\d){12,18}(?![\d-])")
+MAX_PREVIEW_CHARS = int(os.getenv("MAX_PREVIEW_CHARS", "2048"))   # what lists, phones, notifications and briefs show
+
+
+def _mask_email(m: re.Match) -> str:
+    local, domain = m.group(1), m.group(2)
+    if ".redacted-" in local:                       # already masked (a stored copy redacted again)
+        return m.group(0)
+    tag = hmac.new(_link_secret(), m.group(0).lower().encode(), hashlib.sha256).hexdigest()[:6]
+    return f"{local[0].lower()}.redacted-{tag}@{domain}"
+
+
+def _mask_card(m: re.Match) -> str:
+    digits = re.sub(r"\D", "", m.group(0))
+    return f"[card ending {digits[-4:]}]" if 13 <= len(digits) <= 19 and outbound._luhn(digits) else m.group(0)
+
+
 def redact(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {k: "[REDACTED]" if SECRET_KEY_RE.search(str(k)) else redact(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [redact(v) for v in obj]
     if isinstance(obj, str):
-        return SECRET_VALUE_RE.sub(lambda m: (m.group(1) or m.group(2) or "") + "[REDACTED]", obj)
+        obj = SECRET_VALUE_RE.sub(lambda m: (m.group(1) or m.group(2) or "") + "[REDACTED]", obj)
+        if REDACT_PERSONAL:
+            obj = CARD_VALUE_RE.sub(_mask_card, EMAIL_VALUE_RE.sub(_mask_email, obj))
+        return obj
     return obj
+
+
+def preview_of(value: Any, limit: int | None = None) -> Any:
+    """A stored (already redacted) value, cut to MAX_PREVIEW_CHARS when it's long: what lists, the phone page and
+    briefs show. The full redacted copy stays in the database for the drawer, exports and checks."""
+    limit = limit or MAX_PREVIEW_CHARS
+    text = value if isinstance(value, str) else json.dumps(value, default=str, ensure_ascii=False)
+    if text is None or len(text) <= limit:
+        return value
+    return {"_preview": text[:limit], "_truncated": True, "_original_chars": len(text)}
 
 
 def to_stored_json(obj: Any) -> str | None:
@@ -740,6 +920,43 @@ class Policy:
             out.append(seq)
         return out
 
+    @classmethod
+    def _compile_budgets(cls, items: list | None) -> list[dict]:
+        """rules.yaml `budgets:` - model tokens / money an agent may spend per day or month before it's paused."""
+        out = []
+        for i, b in enumerate(items or []):
+            bid = b.get("id") or f"budget-{i}"
+            per, period = b.get("per", "agent"), b.get("period", "day")
+            if per not in ("agent", "together") or period not in ("day", "month"):
+                raise ValueError(f"budgets.{bid}: per must be agent or together, period day or month")
+            tokens, usd = b.get("tokens"), b.get("usd")
+            if tokens is None and usd is None:
+                raise ValueError(f"budgets.{bid}: needs tokens: or usd:")
+            if any(isinstance(v, bool) or (v is not None and (not isinstance(v, (int, float)) or v <= 0))
+                   for v in (tokens, usd)):
+                raise ValueError(f"budgets.{bid}: tokens and usd must be positive numbers")
+            out.append({"id": bid, "per": per, "period": period, "tokens": int(tokens) if tokens else None,
+                        "usd": float(usd) if usd else None, "reason": b.get("reason") or "",
+                        "match": cls._compile_match({k: v for k, v in (b.get("match") or {}).items()
+                                                     if k in ("source", "client")})})
+        return out
+
+    @classmethod
+    def _compile_proofs(cls, items: list | None) -> list[dict]:
+        """rules.yaml `proof_checks:` - after an action reports it's done, look in the real system (proof.py)."""
+        import proof
+        out = []
+        for i, p in enumerate(items or []):
+            pid = p.get("id") or f"proof-{i}"
+            kinds = [k for k in proof.KINDS if k in p]
+            if len(kinds) != 1:
+                raise ValueError(f"proof_checks.{pid}: needs exactly one of {', '.join(proof.KINDS)}")
+            if p.get("expect") is not None and not isinstance(p["expect"], dict):
+                raise ValueError(f"proof_checks.{pid}: expect must map fields to values")
+            out.append({"id": pid, "kind": kinds[0], "spec": p[kinds[0]] or {}, "expect": p.get("expect") or {},
+                        "delay_seconds": float(p.get("delay_seconds", 2)), **cls._compile_match(p.get("match") or {})})
+        return out
+
     def __init__(self, path: Path):
         self.path = path
         self._sig: tuple | None = ()  # never equal to a real signature or None
@@ -755,6 +972,9 @@ class Policy:
         self.source, self.fingerprint = "", verify.rules_fingerprint("")
         self.mode, self.shadow_agents = "enforce", []
         self.upstreams: dict[str, str] = {}
+        self.when_unreachable, self.snapshots = "block", "required"
+        self.budgets: list[dict] = []
+        self.proofs: list[dict] = []
 
     def _maybe_reload(self) -> None:
         sig = _file_sig(self.path)
@@ -770,10 +990,18 @@ class Policy:
                 for i, r in enumerate(data.get("rules") or []):
                     m = r.get("match") or {}
                     approvers = r.get("approvers")
+                    unreachable = r.get("when_unreachable")
                     rules.append({
                         "id": r.get("id") or f"rule-{i}",
                         "action": r.get("action", "deny"),
                         "reason": r.get("reason", ""),
+                        "match_spec": m,
+                        # while the gateway is down: block or allow (offline.py); None = the top-level setting
+                        "when_unreachable": None if unreachable is None else
+                            "allow" if unreachable is True or str(unreachable).lower() == "allow" else "block",
+                        # undo: a copy of what it changes, before it runs (see Decision.snapshot)
+                        "snapshot": str(r["snapshot"]).lower() if r.get("snapshot") not in (None, False) else
+                            ("off" if r.get("snapshot") is False else None),
                         **self._compile_match(m),
                         # review-only options
                         "timeout_seconds": int(r.get("timeout_seconds", APPROVAL_TIMEOUT)),
@@ -819,12 +1047,26 @@ class Policy:
                 mode = str(data.get("mode", "enforce")).lower()
                 if mode not in ("enforce", "shadow"):
                     raise ValueError("mode must be enforce or shadow")
+                wu = data.get("when_unreachable", "block")
+                wu = "allow" if wu is True or str(wu).lower() == "allow" else \
+                    "block" if wu is False or str(wu).lower() in ("block", "deny") else None
+                if wu is None or any(str(r.get("when_unreachable", "block")).lower() not in ("allow", "block", "deny", "true", "false")
+                                     for r in data.get("rules") or []):
+                    raise ValueError("when_unreachable must be block or allow")
+                snaps = str(data.get("snapshots", "required")).lower() if data.get("snapshots") is not False else "off"
+                if snaps not in ("required", "best_effort", "off") or \
+                        any(r["snapshot"] not in (None, "required", "best_effort", "off") for r in rules):
+                    raise ValueError("snapshots / snapshot must be required, best_effort or off")
+                budgets = self._compile_budgets(data.get("budgets"))
+                proofs = self._compile_proofs(data.get("proof_checks"))
                 shadow_agents = data.get("shadow_agents") or []
                 shadow_agents = [shadow_agents] if isinstance(shadow_agents, str) else list(shadow_agents)
                 self.default, self.rules, self.history, self.commands = default, rules, hc, cc
                 self.sequences, self.taint, self.data = sequences, tc, dc
                 self.source, self.fingerprint = source, verify.rules_fingerprint(source)
                 self.mode, self.shadow_agents = mode, shadow_agents
+                self.when_unreachable, self.snapshots = wu, snaps
+                self.budgets, self.proofs = budgets, proofs
                 self.default_reason = data.get("default_reason") or f"default {default}"
                 self.upstreams = {k: str(v).rstrip("/") for k, v in (data.get("upstreams") or {}).items()}
                 log.info("loaded %d rules from %s (default=%s)", len(rules), self.path, default)
@@ -891,10 +1133,39 @@ class Decision(BaseModel):
     would: str | None = None           # shadow mode: deny | review that was let through
     cannot_undo: bool = False          # once it runs it can't be taken back: the agent's person is told first
     risk: int | None = None            # risk.py's score, 0..100: measured only, never part of the decision
+    # Undo: keep a copy of what this changes before it runs. "required": if a copy can't be made, don't run it;
+    # "best_effort": try, and run anyway. snapshot_strict: a rule asked for it by name, so a path with no way to
+    # make a copy (an MCP tool, a client without a snapshot function) must not run it either.
+    snapshot: str | None = None
+    snapshot_strict: bool = False
+
+
+class ChallengeIn(BaseModel):
+    outcome: Literal["approve", "reject"] = "approve"
+
+
+class SnapshotIn(BaseModel):
+    kind: Literal["local", "http", "data"] = "data"
+    ref: str | None = Field(None, max_length=300, description="local: the backup id (squidbrake undo ID)")
+    summary: str | None = Field(None, max_length=1000)
+    data: Any = None                   # the saved copy itself (kept redacted, like every stored value)
+    skipped: str | None = Field(None, max_length=500, description="why no copy could be made (the action was blocked)")
+
+
+class UsageIn(BaseModel):
+    source: str | None = Field(None, max_length=200)
+    session_id: str | None = Field(None, max_length=200)
+    model: str | None = Field(None, max_length=100)
+    input_tokens: int = Field(0, ge=0, le=10**10)
+    output_tokens: int = Field(0, ge=0, le=10**10)
+    cost_usd: float | None = Field(None, ge=0, le=10**7)
 
 
 class ApprovalIn(BaseModel):
     note: str | None = Field(None, max_length=2000)
+    # A passkey's signature over this decision (passkeys.py): {credential_id, statement, challenge,
+    # authenticator_data, client_data_json, signature}
+    device_proof: dict | None = None
 
 
 # --------------------------------------------------------------------------- core
@@ -916,6 +1187,93 @@ def stopped_for(source: str | None, client: str, session_id: str | None = None) 
     if session_id and _live(s.get("sessions", {}).get(session_id)):
         return {**s["sessions"][session_id], "session": session_id, "scope": "session"}
     return None
+
+
+# --------------------------------------------------------------------------- spend brake (rules.yaml `budgets:`)
+
+def _period_start(period: str, now: datetime | None = None) -> datetime:
+    now = now or datetime.now(timezone.utc)
+    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return day.replace(day=1) if period == "month" else day
+
+
+def _period_end(period: str, now: datetime | None = None) -> datetime:
+    start = _period_start(period, now)
+    if period == "day":
+        return start + timedelta(days=1)
+    return start.replace(year=start.year + (start.month == 12), month=start.month % 12 + 1)
+
+
+def _iso(d: datetime) -> str:
+    return d.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def record_usage(client: str, u: UsageIn) -> None:
+    if not (u.input_tokens or u.output_tokens or u.cost_usd):
+        return
+    with engine.begin() as conn:
+        conn.execute(usage.insert().values(at=utcnow(), client=client, source=u.source, session_id=u.session_id,
+                                           model=u.model, input_tokens=u.input_tokens, output_tokens=u.output_tokens,
+                                           cost_usd=u.cost_usd))
+
+
+def _spend_by_agent(since: str) -> list:
+    tokens = func.coalesce(func.sum(usage.c.input_tokens), 0) + func.coalesce(func.sum(usage.c.output_tokens), 0)
+    with engine.connect() as conn:
+        return conn.execute(select(usage.c.source, usage.c.client, tokens.label("tokens"),
+                                   func.coalesce(func.sum(usage.c.cost_usd), 0).label("usd"))
+                            .where(usage.c.at >= since).group_by(usage.c.source, usage.c.client)).all()
+
+
+def budget_status(source: str | None = None, client: str | None = None) -> list[dict]:
+    """Each budget's spend this period: per agent (per: agent) or for all its agents together (per: together).
+    With source/client: only the budgets that cover that agent, and only its own line."""
+    out = []
+    for b in policy.budgets:
+        rows = [r for r in _spend_by_agent(_iso(_period_start(b["period"])))
+                if Policy.matches(b["match"], {"source": r.source, "client": r.client}, None)]
+        if source is not None or client is not None:
+            if not Policy.matches(b["match"], {"source": source, "client": client}, None):
+                continue
+            if b["per"] == "agent":
+                rows = [r for r in rows if (r.source or r.client) == (source or client)]
+        groups: dict[str, list] = {}
+        for r in rows:
+            groups.setdefault(r.source or r.client if b["per"] == "agent" else "together", []).append(r)
+        if source is not None or client is not None:
+            groups.setdefault(source or client if b["per"] == "agent" else "together", [])
+        for who, rs in groups.items():
+            tokens, usd = sum(int(r.tokens or 0) for r in rs), sum(float(r.usd or 0) for r in rs)
+            over = (b["tokens"] is not None and tokens >= b["tokens"]) or (b["usd"] is not None and usd >= b["usd"])
+            out.append({"budget": b["id"], "who": who, "period": b["period"], "tokens": tokens, "usd": round(usd, 4),
+                        "token_limit": b["tokens"], "usd_limit": b["usd"], "paused": over,
+                        "resets_at": _iso(_period_end(b["period"]))})
+    return out
+
+
+def budget_hit(source: str | None, client: str) -> dict | None:
+    """The budget this agent has used up, if any: its actions are paused until the period ends."""
+    if not policy.budgets:
+        return None
+    for s in budget_status(source, client):
+        if s["paused"]:
+            used = (f"{s['tokens']:,} of {s['token_limit']:,} tokens" if s["token_limit"] is not None
+                    and s["tokens"] >= s["token_limit"] else f"${s['usd']:,.2f} of ${s['usd_limit']:,.2f}")
+            whose = "by this agent" if s["who"] != "together" else "by the agents it covers, together"
+            return {**s, "message": f"Paused by the spend limit '{s['budget']}': {used} used this {s['period']} {whose}. "
+                                    f"It starts again {s['resets_at'][:16].replace('T', ' ')} UTC, or when an admin raises "
+                                    f"the limit in rules.yaml."}
+    return None
+
+
+def usage_from_metadata(metadata: dict | None) -> UsageIn | None:
+    u = (metadata or {}).get("usage")
+    if not isinstance(u, dict):
+        return None
+    try:
+        return UsageIn(**{k: u[k] for k in ("model", "input_tokens", "output_tokens", "cost_usd") if k in u})
+    except Exception:
+        return None
 
 
 def _hhmm(iso: str | None) -> str:
@@ -1273,7 +1631,7 @@ def sequence_signals(conn, ev: "EventIn", client: str) -> list[dict]:
             same_agent = and_(events.c.source == ev.source, events.c.client == client)
             scope = {"session": events.c.session_id == ev.session_id if ev.session_id else same_agent,
                      "agent": same_agent, "all": events.c.id.isnot(None)}[a["scope"]]
-            target = _target(ev.input)
+            target = _target(redact(ev.input))    # compared with stored (redacted) copies
             for r in earlier(a["within_hours"], scope):
                 if r.status not in ("completed", "pending"):      # only steps that actually went ahead
                     continue
@@ -1291,7 +1649,7 @@ def sequence_signals(conn, ev: "EventIn", client: str) -> list[dict]:
             scope = {"session": events.c.session_id == ev.session_id if ev.session_id else events.c.source == ev.source,
                      "agent": and_(events.c.source == ev.source, events.c.client == client),
                      "all": events.c.id.isnot(None)}[c["scope"]]
-            target = _target(ev.input)
+            target = _target(redact(ev.input))
             hits = []
             for r in earlier(c["within_hours"], scope):
                 if c["sum"] and r.status not in ("completed", "pending"):  # only completed or allowed actions contribute amounts
@@ -1387,7 +1745,8 @@ def taint_signals(conn, ev: "EventIn", client: str) -> list[dict]:
               [r.output for r in rows if r.output and r.kind != "prompt" and not untrusted(r)]
     out: list[dict] = []
     if tc["untrusted_destination"] != "off":
-        for dest in taint.destinations(ev.input, line):
+        # compared with what was stored, so with the same masking (an address keeps its domain and fingerprint)
+        for dest in taint.destinations(redact(ev.input), redact(line) if line else line):
             if taint.own_domain(dest, policy.history["company_domains"]):
                 continue
             hit = next((r for r in outside if taint.appears_in(dest, r.output)), None)
@@ -1416,11 +1775,17 @@ def reported_effects(metadata: dict | None) -> str | None:
 
 def record_event(ev: EventIn, client: str, client_ip: str | None) -> Decision:
     signals: list[dict] = []
+    if spent := usage_from_metadata(ev.metadata):      # the hook reports model tokens with each action
+        spent.source, spent.session_id = ev.source, ev.session_id
+        record_usage(client, spent)
+    already_done = ev.error is not None or ev.output is not None
     if stop := stopped_for(ev.source, client, ev.session_id):
         decision, rule = "deny", policy.DEFAULT_RULE
         rule_id = "session-stop" if stop.get("session") else "emergency-stop"
         reason = stop_message(stop)
         remind_if_still_stopped(stop, ev.name)
+    elif not already_done and ev.kind != "prompt" and (over := budget_hit(ev.source, client)):
+        decision, rule, rule_id, reason = "deny", policy.DEFAULT_RULE, f"budget:{over['budget']}", over["message"]
     else:
         # Policy sees the raw input; storage only ever sees the redacted copy.
         decision, reason, rule_id, rule = policy.evaluate(
@@ -1433,7 +1798,7 @@ def record_event(ev: EventIn, client: str, client_ip: str | None) -> Decision:
                 # the business (who asked for this payment); taint and command checks are more general.
                 signals = sequence_signals(conn, ev, client)
                 # A command that only looks isn't a change: running `git status` twice is not a duplicate.
-                signals += history_signals(conn, ev.name, ev.input, to_stored_json(ev.input), ev.source,
+                signals += history_signals(conn, ev.name, redact(ev.input), to_stored_json(ev.input), ev.source,
                                            ev.session_id, is_change=decision == "review" and not only_reads,
                                            client=client, only_reads=only_reads)
                 signals += data_signals(ev) + taint_signals(conn, ev, client) + command_found                     + written_then_run(conn, ev, client)
@@ -1465,7 +1830,8 @@ def record_event(ev: EventIn, client: str, client_ip: str | None) -> Decision:
         risk_score, risk_why = None, []
     would = None
     # Shadow mode lets it through but records what would have happened. Stops and catastrophic commands still apply.
-    if decision in ("deny", "review") and rule_id not in ("emergency-stop", "session-stop", "command:catastrophic_command")             and policy.shadow_for(ev.source, client):
+    if decision in ("deny", "review") and rule_id not in ("emergency-stop", "session-stop", "command:catastrophic_command") \
+            and not str(rule_id).startswith("budget:") and policy.shadow_for(ev.source, client):
         would = decision
         reason = f"Shadow mode, allowed. Would have {'been blocked' if decision == 'deny' else 'waited for approval'}: {reason}"
         decision = "allow"
@@ -1489,8 +1855,20 @@ def record_event(ev: EventIn, client: str, client_ip: str | None) -> Decision:
     else:
         status = "pending"
 
+    # Undo: should a copy of what this changes be kept before it runs? A rule can ask by name (snapshot: required);
+    # otherwise everything held for a person or flagged as irreversible gets rules.yaml `snapshots:` (default required).
+    snap_want, snap_strict = None, False
+    if decision != "deny" and not already_ran:
+        named = rule.get("snapshot")
+        risky = decision == "review" or any(s.get("check") in ("irreversible_command", "catastrophic_command")
+                                            for s in signals)
+        snap_want = named if named else policy.snapshots if risky else None
+        snap_want = None if snap_want == "off" else snap_want
+        snap_strict = named == "required"
+
     row = {
         "id": str(uuid.uuid4()), "created_at": now,
+        "snapshot": json.dumps({"want": snap_want, "strict": snap_strict}) if snap_want else None,
         "completed_at": now if status in ("completed", "failed") else None,
         "client": client, "client_ip": client_ip, "source": ev.source, "session_id": ev.session_id,
         "kind": ev.kind, "name": ev.name, "status": status, "decision": decision, "rule_id": rule_id,
@@ -1513,11 +1891,99 @@ def record_event(ev: EventIn, client: str, client_ip: str | None) -> Decision:
     audit_log.info(json.dumps({k: row[k] for k in ("id", "created_at", "client", "source", "session_id",
                                                     "kind", "name", "status", "rule_id")}))
     forwarder.emit(siem_record("decision", row))
+    if decision != "deny" and any(Policy.matches(p, {"kind": ev.kind, "name": ev.name, "source": ev.source,
+                                                     "client": client, "session_id": ev.session_id}, ev.input)
+                                  for p in policy.proofs):
+        _raw_inputs[row["id"]] = ev.input              # proof checks fill {input.x} from the real values
+        while len(_raw_inputs) > 2000:
+            _raw_inputs.pop(next(iter(_raw_inputs)))
+        if already_ran and status == "completed":
+            start_proof(row["id"], ev.output)
     if status == "awaiting_approval":
         notify_approval_needed(row)
+        start_brief(row["id"])
     return Decision(event_id=row["id"], decision=decision, reason=reason, rule_id=rule_id,
                     status=status, approval_deadline=deadline, signals=signals or None, would=would, risk=risk_score,
-                    cannot_undo=cannot_undo({"rule_id": rule_id, "signals": signals, "reason": reason}))
+                    cannot_undo=cannot_undo({"rule_id": rule_id, "signals": signals, "reason": reason}),
+                    snapshot=snap_want, snapshot_strict=snap_strict)
+
+
+_raw_inputs: dict[str, Any] = {}
+
+
+# --------------------------------------------------------------------------- proof of work (proof.py)
+
+def run_proofs(event_id: str, output: Any = None) -> dict | None:
+    """Look in the real system for what this action says it did. Records the first matching check's answer."""
+    import proof
+    with engine.connect() as conn:
+        row = conn.execute(select(events).where(events.c.id == event_id)).first()
+    if row is None or row.status not in ("completed", "pending"):
+        return None
+    stored_in = json.loads(row.input) if row.input else None
+    raw_in = _raw_inputs.get(event_id, stored_in)
+    out = output if output is not None else (json.loads(row.output) if row.output else None)
+    values = {"kind": row.kind, "name": row.name, "source": row.source, "client": row.client, "session_id": row.session_id}
+    check = next((p for p in policy.proofs if Policy.matches(p, values, raw_in)), None)
+    if check is None:
+        return None
+    result = proof.run(check, raw_in, out)
+    result["at"] = utcnow()
+    with audited_tx() as conn:
+        conn.execute(update(events).where(events.c.id == event_id).values(
+            proof_status=result["status"], proof=to_stored_json(result)))
+        audit(conn, "proof", "event.proof", event_id, status=result["status"], check=check["id"],
+              message=result["message"][:500])
+    forwarder.emit({**siem_record("proof", row), "proof": result["status"], "reason": result["message"]})
+    if result["status"] == "mismatch":
+        notify_text(f"Not actually done: {row.name}", f"{row.source or row.client}: {result['message']}")
+    return result
+
+
+def start_proof(event_id: str, output: Any = None) -> None:
+    check_delay = max([p["delay_seconds"] for p in policy.proofs] or [0])
+
+    def go():
+        time.sleep(min(check_delay, 30))       # give the other system a moment to show the change
+        try:
+            run_proofs(event_id, output)
+        except Exception:
+            log.exception("proof check failed for %s", event_id)
+    threading.Thread(target=go, daemon=True).start()
+
+
+# --------------------------------------------------------------------------- AI approval briefs (brief.py)
+
+def write_brief(event_id: str) -> dict | None:
+    import brief
+    cfg = settings()
+    if not (cfg.get("ai_briefs") and cfg.get("ai_key")):
+        return None
+    with engine.connect() as conn:
+        row = conn.execute(select(events).where(events.c.id == event_id)).first()
+    if row is None:
+        return None
+    d = row_to_dict(row)
+    d["input"] = preview_of(d["input"])
+    context = [{**s, "input": preview_of(s.get("input"), 300)} for s in event_context(row, limit=8)]
+    out = brief.write(cfg["ai_key"], cfg.get("ai_model") or None, d, context)
+    out["at"] = utcnow()
+    with engine.begin() as conn:
+        conn.execute(update(events).where(events.c.id == event_id).values(brief=json.dumps(out)))
+    return out
+
+
+def start_brief(event_id: str) -> None:
+    cfg = settings()
+    if not (cfg.get("ai_briefs") and cfg.get("ai_key")):
+        return
+
+    def go():
+        try:
+            write_brief(event_id)
+        except Exception:
+            log.exception("AI brief failed for %s", event_id)
+    threading.Thread(target=go, daemon=True).start()
 
 
 # --------------------------------------------------------------------------- notifications + approval links
@@ -1741,10 +2207,14 @@ def notify_approval_needed(row: dict) -> None:
                 httpx.post(cfg["ntfy_server"].rstrip("/"), timeout=10, json={
                     "topic": cfg["ntfy_topic"], "title": title, "message": body, "priority": 4,
                     "tags": ["raised_hand"], "click": link,
-                    "actions": ([] if cannot_undo(row) else [   # can't be undone: approve on the page, which asks first
+                    # can't be undone, or approvals need Face ID: approve on the page, which asks first
+                    "actions": ([] if cannot_undo(row) or cfg.get("require_device_signature") else [
                         {"action": "http", "label": "Approve", "url": f"{base}/v1/a/{token}/approve", "method": "POST", "clear": True},
                     ]) + [
                         {"action": "http", "label": "Reject", "url": f"{base}/v1/a/{token}/reject", "method": "POST", "clear": True},
+                        # the kill switch, one tap from the lock screen: stops this agent until an admin resumes it
+                        {"action": "http", "label": "Stop agent", "url": f"{base}/v1/a/{token}/stop", "method": "POST",
+                         "clear": True},
                     ],
                 }).raise_for_status()
             except Exception:
@@ -1798,9 +2268,41 @@ def can_approve(who: str) -> bool:
     return keystore.can_approve(who)
 
 
+def _device_check(event_id: str, outcome: str, who: str, proof: dict | None, rp_id: str | None) -> tuple[str | None, dict | None]:
+    """A passkey's signature on this decision, checked. -> (device name, the proof to keep in the audit trail).
+    With Settings > "Approvals need Face ID or fingerprint" on, an approval without one is refused (rejecting never
+    needs one: saying no is always safe)."""
+    import passkeys
+    required = bool(settings().get("require_device_signature")) and outcome == "allow"
+    if not proof:
+        if required:
+            raise HTTPException(403, "approvals need Face ID or fingerprint here: open the approval page on your "
+                                     "registered phone or laptop and approve there")
+        return None, None
+    with engine.connect() as conn:
+        dev = conn.execute(select(devices).where(devices.c.credential_id == str(proof.get("credential_id") or "")
+                                                 .rstrip("="))).first()
+    if dev is None or dev.person != who:
+        raise HTTPException(403, f"that passkey isn't registered to {who}")
+    try:
+        count = passkeys.verify_assertion(proof=proof, public_key=json.loads(dev.public_key), rp_id=rp_id or "",
+                                          event_id=event_id, outcome="approve" if outcome == "allow" else "reject")
+    except passkeys.PasskeyError as e:
+        raise HTTPException(403, f"the device signature didn't check: {e}")
+    if dev.sign_count and count and count <= dev.sign_count:
+        raise HTTPException(403, "that passkey signature was used before (a copied passkey?)")
+    with engine.begin() as conn:
+        conn.execute(update(devices).where(devices.c.credential_id == dev.credential_id)
+                     .values(sign_count=count, last_used_at=utcnow()))
+    kept = {k: proof.get(k) for k in ("statement", "authenticator_data", "client_data_json", "signature")}
+    kept.update(credential_id=dev.credential_id, challenge=passkeys.challenge_of(str(proof.get("statement"))))
+    return f"passkey: {dev.name or 'device'}", kept
+
+
 def decide(event_id: str, outcome: Literal["allow", "deny"], who: str, note: str | None,
-           via: str = "dashboard") -> Decision:
+           via: str = "dashboard", device_proof: dict | None = None, rp_id: str | None = None) -> Decision:
     expire_overdue()
+    decided_with, kept_proof = _device_check(event_id, outcome, who, device_proof, rp_id)
     with audited_tx() as conn:
         row = conn.execute(select(events).where(events.c.id == event_id)).first()
         if row is None:
@@ -1823,10 +2325,11 @@ def decide(event_id: str, outcome: Literal["allow", "deny"], who: str, note: str
         won = conn.execute(update(events).where(
             events.c.id == event_id, events.c.status == "awaiting_approval",
         ).values(status="pending" if outcome == "allow" else "denied", decision=outcome,
-                 decided_by=who, decided_at=utcnow(), decision_note=note)).rowcount
+                 decided_by=who, decided_at=utcnow(), decision_note=note, decided_with=decided_with)).rowcount
         if not won:
             raise HTTPException(409, "event was decided by someone else a moment ago")
-        audit(conn, who, "event.approved" if outcome == "allow" else "event.rejected", event_id, note=note, via=via)
+        audit(conn, who, "event.approved" if outcome == "allow" else "event.rejected", event_id, note=note, via=via,
+              **({"device_proof": kept_proof, "decided_with": decided_with} if kept_proof else {}))
         forwarder.emit(siem_record("approved" if outcome == "allow" else "rejected",
                                    conn.execute(select(events).where(events.c.id == event_id)).first()))
     audit_log.info(json.dumps({"id": event_id, "approval": outcome, "decided_by": who, "via": via}))
@@ -1838,9 +2341,11 @@ def current_decision(event_id: str) -> Decision:
         row = conn.execute(select(events).where(events.c.id == event_id)).first()
     if row is None:
         raise HTTPException(404, "event not found")
+    snap = json.loads(row.snapshot) if row.snapshot else {}
     return Decision(event_id=row.id, decision=row.decision, reason=row.reason or "", rule_id=row.rule_id,
                     status=row.status, approval_deadline=row.approval_deadline,
-                    decided_by=row.decided_by, decision_note=row.decision_note)
+                    decided_by=row.decided_by, decision_note=row.decision_note,
+                    snapshot=snap.get("want"), snapshot_strict=bool(snap.get("strict")))
 
 
 async def wait_for_decision(event_id: str, wait: float) -> Decision:
@@ -1871,6 +2376,8 @@ def complete_event(event_id: str, res: ResultIn) -> dict:
         audit(conn, None, f"event.{status}", event_id, output_sha256=_sha(output), error=res.error,
               duration_ms=res.duration_ms)
     audit_log.info(json.dumps({"id": event_id, "status": status, "duration_ms": res.duration_ms}))
+    if status == "completed" and policy.proofs:
+        start_proof(event_id, res.output)          # the agent says it's done: look in the real system
     return {"event_id": event_id, "status": status}
 
 
@@ -1893,7 +2400,7 @@ def cannot_undo(d: dict) -> bool:
 
 def row_to_dict(row) -> dict:
     d = dict(row._mapping)
-    for f in ("input", "output", "metadata", "approvers", "signals"):
+    for f in ("input", "output", "metadata", "approvers", "signals", "snapshot", "proof", "brief"):
         if d.get(f) is not None:
             d[f] = json.loads(d[f])
     d["cannot_undo"] = cannot_undo(d)
@@ -1986,7 +2493,6 @@ def digest_text(r: dict, catches: list[dict] | None = None) -> str:
                          + (f" It would have: {c['effect']}" if c.get("effect") else ""))
     lines += [
              f"Signed off by a person: {a['held']} held, {a['approved']} approved, {a['rejected']} rejected, "
-             f"Signed off by a person: {a['held']} held, {a['approved']} approved, {a['rejected']} rejected, "
              f"{a['timed_out']} timed out"
              + (f", median decision time {int(a['median_seconds_to_decide'])}s." if a['median_seconds_to_decide'] is not None else "."),
              f"{r['total']} agent actions on the record: {s.get('completed', 0)} completed, {s.get('denied', 0)} refused, "
@@ -2052,6 +2558,11 @@ async def lifespan(app: FastAPI):
         elif keystore.from_env and (unknown := keystore.approvers - keystore.names()):
             log.warning("GATEWAY_APPROVERS names keys that don't exist: %s", ", ".join(sorted(unknown)))
     policy._maybe_reload()
+    try:
+        if n := await run_in_threadpool(sign_missing_checkpoints):
+            log.info("signed %d audit checkpoint(s) for history recorded before checkpoints existed", n)
+    except Exception:
+        log.exception("couldn't sign audit checkpoints (the chain itself is unaffected)")
     app.state.http = httpx.AsyncClient(timeout=PROXY_TIMEOUT, follow_redirects=False)
     # MCP by URL: no read timeout, a held call or an event stream can stay open a long time
     app.state.mcp_http = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=None), follow_redirects=False)
@@ -2082,6 +2593,10 @@ def auth(request: Request, x_gateway_key: str | None = Header(None)) -> str:
         raise HTTPException(401, "missing or invalid X-Gateway-Key")
     if name in READ_ONLY_KEYS and (request.method not in ("GET", "HEAD") or request.url.path.startswith("/proxy/")):
         raise HTTPException(403, f"'{name}' is a read-only key: it can look, but not change anything")
+    # People with view-only access can look at everything they may see and change nothing (env keys predate levels)
+    if request.method not in ("GET", "HEAD") and keystore.enabled and not keystore.from_env \
+            and keystore.access(name) == "viewer":
+        raise HTTPException(403, f"'{name}' can view only: ask an owner or admin for approver access to act")
     return name
 
 
@@ -2126,20 +2641,28 @@ async def get_decision(event_id: str, wait: float = Query(0, ge=0, le=60,
     return await wait_for_decision(event_id, wait)
 
 
+def _rp_id(request: Request) -> str:
+    import passkeys
+    return passkeys.rp_id_for(settings().get("public_url"), request.headers.get("host") or "localhost")
+
+
 @app.post("/v1/events/{event_id}/approve", response_model=Decision)
-def approve(event_id: str, body: ApprovalIn | None = None, who: str = Depends(auth)):
-    return decide(event_id, "allow", who, body.note if body else None)
+def approve(event_id: str, request: Request, body: ApprovalIn | None = None, who: str = Depends(auth)):
+    return decide(event_id, "allow", who, body.note if body else None,
+                  device_proof=body.device_proof if body else None, rp_id=_rp_id(request))
 
 
 @app.post("/v1/events/{event_id}/reject", response_model=Decision)
-def reject(event_id: str, body: ApprovalIn | None = None, who: str = Depends(auth)):
-    return decide(event_id, "deny", who, body.note if body else None)
+def reject(event_id: str, request: Request, body: ApprovalIn | None = None, who: str = Depends(auth)):
+    return decide(event_id, "deny", who, body.note if body else None,
+                  device_proof=body.device_proof if body else None, rp_id=_rp_id(request))
 
 
 @app.get("/v1/me")
 def me(who: str = Depends(auth)):
     i = keystore.info(who)
     return {"client": who, "kind": i["kind"], "roles": i["roles"], "is_admin": keystore.is_admin(who),
+            "is_owner": keystore.is_owner(who), "access": keystore.access(who),
             "can_approve": can_approve(who), "auth_enabled": keystore.enabled,
             "mode": policy.mode, "shadow_agents": policy.shadow_agents, "version": VERSION, "latest": latest_known()}
 
@@ -2207,18 +2730,46 @@ def phone_link(request: Request, who: str = Depends(person), x_gateway_key: str 
 
 # ---- team (admins)
 
+Access = Literal["owner", "admin", "approver", "viewer"]
+LEVEL_ROLES = ("owner", "admin")
+
+
 class MemberIn(BaseModel):
     name: str = Field(..., max_length=64)
     kind: Literal["person", "agent"] = "person"
     approver: bool = False
     roles: list[str] = Field(default_factory=list)
     owner: str | None = Field(None, max_length=64, description="for an agent: the person it works for")
+    access: Access | None = Field(None, description="for a person: owner, admin, approver or viewer (sets approver "
+                                                    "and the owner/admin roles)")
 
 
 class MemberPatch(BaseModel):
     approver: bool | None = None
     roles: list[str] | None = None
     owner: str | None = Field(None, max_length=64, description="for an agent: the person it works for ('' clears it)")
+    access: Access | None = None
+
+
+def _with_access(access: str | None, approver: bool | None, roles: list[str] | None,
+                 current_roles: list[str]) -> tuple[bool | None, list[str] | None]:
+    """An access level is approver + the owner/admin roles; other roles (finance, ops...) are kept as they are."""
+    if access is None:
+        return approver, roles
+    others = [r for r in (roles if roles is not None else current_roles) if r not in LEVEL_ROLES]
+    level = {"owner": ["owner", "admin"], "admin": ["admin"]}.get(access, [])
+    return access != "viewer", level + others
+
+
+def _check_level_change(who: str, name: str, before: list[str], after: list[str]) -> None:
+    """Only an owner makes or unmakes admins and owners, and a team always keeps at least one owner."""
+    changed = {r for r in LEVEL_ROLES if (r in before) != (r in after)}
+    if changed and not keystore.is_owner(who):
+        raise HTTPException(403, f"only an owner can change who is {' or '.join(sorted(changed))}")
+    if "owner" in before and "owner" not in after:
+        owners = [m["name"] for m in keystore.listing() if "owner" in m["roles"]]
+        if owners == [name]:
+            raise HTTPException(400, "a team needs at least one owner: make someone else an owner first")
 
 
 def _team_call(fn):
@@ -2235,19 +2786,31 @@ def team_list(_: str = Depends(person)):
 
 @app.post("/v1/team")
 def team_add(m: MemberIn, who: str = Depends(admin)):
-    secret = _team_call(lambda: keystore.add(m.name, approver=m.approver, kind=m.kind, roles=m.roles, owner=m.owner))
+    approver, roles = m.approver, m.roles
+    if m.kind == "person":
+        approver, roles = _with_access(m.access, m.approver, m.roles, [])
+        _check_level_change(who, m.name, [], [r.strip().lower() for r in roles])
+    secret = _team_call(lambda: keystore.add(m.name, approver=approver, kind=m.kind, roles=roles, owner=m.owner))
     with audited_tx() as conn:
-        audit(conn, who, "team.added", m.name, kind=m.kind, approver=m.approver, roles=m.roles, owner=m.owner)
-    return {"name": m.name, "key": secret, "note": "shown once; the gateway keeps only a hash"}
+        audit(conn, who, "team.added", m.name, kind=m.kind, approver=approver, roles=roles, owner=m.owner,
+              access=keystore.access(m.name))
+    return {"name": m.name, "key": secret, "access": keystore.access(m.name),
+            "note": "shown once; the gateway keeps only a hash"}
 
 
 @app.patch("/v1/team/{name}")
 def team_update(name: str, p: MemberPatch, who: str = Depends(admin)):
-    if name == who and p.roles is not None and "admin" not in p.roles:
-        raise HTTPException(400, "you can't remove your own admin role")
-    info = _team_call(lambda: keystore.update(name, approver=p.approver, roles=p.roles, owner=p.owner))
+    before = keystore.info(name)["roles"] if name in keystore.names() else []
+    approver, roles = _with_access(p.access, p.approver, p.roles, before)
+    if roles is not None:
+        roles = [r.strip().lower() for r in roles]
+        if name == who and not set(roles) & set(LEVEL_ROLES):
+            raise HTTPException(400, "you can't remove your own admin role")
+        _check_level_change(who, name, before, roles)
+    info = _team_call(lambda: keystore.update(name, approver=approver, roles=roles, owner=p.owner))
     with audited_tx() as conn:
-        audit(conn, who, "team.updated", name, approver=info["approver"], roles=info["roles"], owner=info["owner"])
+        audit(conn, who, "team.updated", name, approver=info["approver"], roles=info["roles"], owner=info["owner"],
+              access=info["access"])
     return {"name": name, **info}
 
 
@@ -2255,6 +2818,8 @@ def team_update(name: str, p: MemberPatch, who: str = Depends(admin)):
 def team_remove(name: str, who: str = Depends(admin)):
     if name == who:
         raise HTTPException(400, "you can't remove your own key")
+    if name in keystore.names():
+        _check_level_change(who, name, keystore.info(name)["roles"], [])
     _team_call(lambda: keystore.remove(name))
     with audited_tx() as conn:
         audit(conn, who, "team.removed", name)
@@ -2280,6 +2845,10 @@ def controls_stop(body: StopIn, who: str = Depends(person)):
     """Anyone who can approve (or any admin) can pull the brake; only admins can release it."""
     if not (can_approve(who) or keystore.is_admin(who)):
         raise HTTPException(403, "only approvers and admins can stop agents")
+    return stop_agents(body, who)
+
+
+def stop_agents(body: StopIn, who: str, via: str = "dashboard") -> dict:
     entry = {"by": who, "at": utcnow(), "reason": body.reason}
     if body.minutes:
         entry["until"] = (datetime.now(timezone.utc) + timedelta(minutes=body.minutes)).isoformat().replace("+00:00", "Z")
@@ -2302,7 +2871,7 @@ def controls_stop(body: StopIn, who: str = Depends(person)):
         else:
             s["all"] = entry
         state_set(conn, "stop", s)
-        audit(conn, who, "controls.stopped", target, reason=body.reason)
+        audit(conn, who, "controls.stopped", target, reason=body.reason, via=via)
     log.warning("STOP (%s) by %s: %s", target if target != "*" else "all agents", who, body.reason)
     return s
 
@@ -2372,11 +2941,22 @@ class SettingsIn(BaseModel):
     siem_url: str | None = Field(None, max_length=1000)          # every decision, as it happens, to Splunk / Datadog / any HTTP
     siem_token: str | None = Field(None, max_length=500)
     siem_format: Literal["json", "splunk", "datadog"] | None = None
+    ai_briefs: bool | None = None                                # a plain-English risk note on each held action
+    ai_key: str | None = Field(None, max_length=300)             # the customer's own Anthropic API key ("" removes it)
+    ai_model: str | None = Field(None, max_length=100)
+    require_device_signature: bool | None = None                 # approvals need Face ID / fingerprint (a passkey)
+
+
+def public_settings() -> dict:
+    """Settings as the dashboard sees them: the AI key is never sent back, only whether one is set."""
+    s = settings()
+    key = s.pop("ai_key", "") or ""
+    return {**s, "ai_key_set": bool(key), "ai_key_hint": f"…{key[-4:]}" if len(key) > 8 else ""}
 
 
 @app.get("/v1/settings")
 def get_settings(_: str = Depends(admin)):
-    return settings()
+    return public_settings()
 
 
 @app.put("/v1/settings")
@@ -2389,6 +2969,13 @@ def put_settings(body: SettingsIn, who: str = Depends(admin)):
     if changes.get("email_to") and not all(re.fullmatch(r"[^@\s,]+@[^@\s,]+\.[^@\s,]+", a.strip())
                                            for a in changes["email_to"].split(",") if a.strip()):
         raise HTTPException(400, "email_to: email addresses, separated by commas")
+    if changes.get("ai_model") and not re.fullmatch(r"[a-z0-9][a-z0-9.\-]{2,99}", changes["ai_model"]):
+        raise HTTPException(400, "ai_model: a model id such as claude-opus-5-5")
+    if changes.get("require_device_signature"):
+        with engine.connect() as conn:
+            if conn.execute(select(devices.c.credential_id).where(devices.c.person == who).limit(1)).first() is None:
+                raise HTTPException(400, "register your own phone or laptop first (📱 Phone → Set up Face ID), so "
+                                         "you can still approve once this is on")
     if changes.get("ntfy_topic") and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", changes["ntfy_topic"]):
         raise HTTPException(400, "ntfy_topic: letters, digits, '-' and '_' only")
     if changes.get("notify_as") and not can_approve(changes["notify_as"]):
@@ -2404,7 +2991,7 @@ def put_settings(body: SettingsIn, who: str = Depends(admin)):
         state_set(conn, "settings", current)
         # Record which settings changed, never the webhook secrets themselves.
         audit(conn, who, "settings.updated", None, changed=sorted(changes))
-    return settings()
+    return public_settings()
 
 
 @app.post("/v1/settings/siem-test")
@@ -2458,10 +3045,12 @@ def link_event(token: str):
     if row is None:
         raise HTTPException(404, "event not found")
     d = row_to_dict(row)
-    return {"approver": approver, "context": event_context(row), **{k: d[k] for k in (
+    d["input"] = preview_of(d["input"])
+    return {"approver": approver, "context": event_context(row),
+            "device_required": bool(settings().get("require_device_signature")), **{k: d[k] for k in (
         "id", "name", "kind", "source", "client", "session_id", "created_at", "status", "decision", "rule_id",
         "reason", "input", "approval_deadline", "approval_on_timeout", "decided_by", "decided_at", "decision_note",
-        "signals", "cannot_undo")}}
+        "signals", "cannot_undo", "brief", "snapshot", "decided_with")}}
 
 
 # ---- the story behind an action, and what people decided before
@@ -2575,11 +3164,216 @@ def get_slack_manifest(request: Request, _: str = Depends(admin)):
     return {"manifest": slack_manifest(base), "public": bool(settings().get("public_url"))}
 
 
+# Before /v1/a/{token}/{outcome}, which would otherwise take these paths.
+@app.post("/v1/a/{token}/challenge")
+def link_challenge(token: str, body: ChallengeIn, request: Request):
+    event_id, approver = read_link_token(token)
+    return _challenge(event_id, body.outcome, approver, request)
+
+
+@app.post("/v1/a/{token}/stop")
+def link_stop(token: str, body: StopIn | None = None):
+    """Kill switch from a notification: stop the agent that asked, in one tap (an admin resumes it)."""
+    event_id, approver = read_link_token(token)
+    with engine.connect() as conn:
+        row = conn.execute(select(events.c.source, events.c.client).where(events.c.id == event_id)).first()
+    if row is None:
+        raise HTTPException(404, "event not found")
+    agent = row.source or row.client
+    reason = (body.reason if body and body.reason else None) or "stopped from a notification"
+    return stop_agents(StopIn(agent=agent, reason=reason, minutes=body.minutes if body else None), approver, via="link")
+
+
 @app.post("/v1/a/{token}/{outcome}", response_model=Decision)
-def link_decide(token: str, outcome: Literal["approve", "reject"], body: ApprovalIn | None = None):
+def link_decide(token: str, outcome: Literal["approve", "reject"], request: Request, body: ApprovalIn | None = None):
     event_id, approver = read_link_token(token)
     return decide(event_id, "allow" if outcome == "approve" else "deny", approver,
-                  body.note if body else None, via="link")
+                  body.note if body else None, via="link", device_proof=body.device_proof if body else None,
+                  rp_id=_rp_id(request))
+
+
+# ---- while the gateway is down (offline.py)
+
+@app.get("/v1/policy/offline")
+def policy_offline(who: str = Depends(auth)):
+    """What each rule says to do while this gateway can't be reached, for the agents' computers to keep a copy of.
+    First matching rule wins, as on the gateway; `default` covers everything else."""
+    policy._maybe_reload()
+    return {"client": who, "default": policy.when_unreachable, "fingerprint": policy.fingerprint,
+            "rules": [{"id": r["id"], "match": r["match_spec"], "when_unreachable": r["when_unreachable"] or policy.when_unreachable}
+                      for r in policy.rules]}
+
+
+# ---- spend brake
+
+@app.post("/v1/usage")
+def post_usage(u: UsageIn, who: str = Depends(auth)):
+    """Model tokens (and money, if known) an agent just spent. rules.yaml `budgets:` pause it when it's over."""
+    record_usage(who, u)
+    over = budget_hit(u.source, who)
+    return {"recorded": True, "paused": bool(over), "message": over["message"] if over else None}
+
+
+@app.get("/v1/budgets")
+def get_budgets(_: str = Depends(person)):
+    return {"budgets": [{k: b[k] for k in ("id", "per", "period", "tokens", "usd", "reason")} for b in policy.budgets],
+            "spend": budget_status()}
+
+
+# ---- undo snapshots
+
+SNAPSHOT_MAX_CHARS = int(os.getenv("SNAPSHOT_MAX_CHARS", str(2_000_000)))
+
+
+def save_snapshot(event_id: str, snap: SnapshotIn, who: str) -> dict:
+    with engine.connect() as conn:
+        row = conn.execute(select(events.c.id, events.c.client, events.c.snapshot).where(events.c.id == event_id)).first()
+    if row is None:
+        raise HTTPException(404, "event not found")
+    if keystore.enabled and who != row.client and not keystore.is_admin(who):
+        raise HTTPException(403, "only the agent that asked (or an admin) can attach its snapshot")
+    current = json.loads(row.snapshot) if row.snapshot else {}
+    if snap.skipped:
+        current.update(skipped=snap.skipped[:500], at=utcnow())
+        sid = None
+    else:
+        data = json.dumps(redact(snap.data), default=str, ensure_ascii=False) if snap.data is not None else None
+        if data and len(data) > SNAPSHOT_MAX_CHARS:
+            raise HTTPException(413, f"the copy is {len(data):,} characters; the limit is {SNAPSHOT_MAX_CHARS:,}")
+        sid = str(uuid.uuid4())
+        current.update(id=sid, kind=snap.kind, ref=snap.ref, summary=(snap.summary or "")[:1000], at=utcnow())
+        current.pop("skipped", None)
+    with audited_tx() as conn:
+        if sid:
+            conn.execute(snapshots.insert().values(id=sid, event_id=event_id, created_at=utcnow(), kind=snap.kind,
+                                                   ref=snap.ref, summary=snap.summary, data=data, sha256=_sha(data)))
+        conn.execute(update(events).where(events.c.id == event_id).values(snapshot=json.dumps(current)))
+        audit(conn, who, "event.snapshot", event_id, kind=snap.kind, ref=snap.ref, skipped=snap.skipped,
+              data_sha256=_sha(data) if sid else None)
+    return current
+
+
+@app.post("/v1/events/{event_id}/snapshot")
+def post_snapshot(event_id: str, snap: SnapshotIn, who: str = Depends(auth)):
+    """The copy kept right before the action ran (or why none could be made, in which case it didn't run)."""
+    return save_snapshot(event_id, snap, who)
+
+
+@app.get("/v1/events/{event_id}/snapshots")
+def get_snapshots(event_id: str, _: str = Depends(person)):
+    with engine.connect() as conn:
+        rows = conn.execute(select(snapshots).where(snapshots.c.event_id == event_id)
+                            .order_by(snapshots.c.created_at)).all()
+    return {"snapshots": [{**dict(r._mapping), "data": json.loads(r.data) if r.data else None} for r in rows]}
+
+
+# ---- proof of work, AI briefs
+
+@app.post("/v1/events/{event_id}/proof")
+def recheck_proof(event_id: str, _: str = Depends(person)):
+    """Look in the real system again (e.g. after it was slow to show the change)."""
+    result = run_proofs(event_id)
+    if result is None:
+        raise HTTPException(404, "no proof check in rules.yaml matches this action (proof_checks:), or it hasn't run")
+    return result
+
+
+@app.post("/v1/events/{event_id}/brief")
+def regenerate_brief(event_id: str, _: str = Depends(person)):
+    if not (settings().get("ai_briefs") and settings().get("ai_key")):
+        raise HTTPException(400, "AI briefs are off: an admin turns them on in Settings with the team's Anthropic key")
+    return write_brief(event_id) or {"error": "event not found"}
+
+
+# ---- passkeys: approvals signed by Face ID / fingerprint (passkeys.py)
+
+class DeviceFinishIn(BaseModel):
+    name: str = Field("My device", max_length=100)
+    challenge: str = Field(..., max_length=200)
+    credential_id: str = Field(..., max_length=400)
+    client_data_json: str = Field(..., max_length=20000)
+    attestation_object: str = Field(..., max_length=20000)
+
+
+def _approver(who: str) -> str:
+    if not can_approve(who):
+        raise HTTPException(403, f"'{who}' can't approve, so there's nothing to sign")
+    return who
+
+
+@app.post("/v1/devices/register/start")
+def device_register_start(request: Request, who: str = Depends(person)):
+    import passkeys
+    _approver(who)
+    rp = _rp_id(request)
+    with engine.connect() as conn:
+        have = [r[0] for r in conn.execute(select(devices.c.credential_id).where(devices.c.person == who)).all()]
+    return {"rp": {"id": rp, "name": "Squidbrake"},
+            "user": {"id": passkeys.b64u(hashlib.sha256(who.encode()).digest()[:16]), "name": who, "displayName": who},
+            "challenge": passkeys.registration_challenge(_link_secret(), who),
+            "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
+            "authenticatorSelection": {"userVerification": "required", "residentKey": "preferred"},
+            "excludeCredentials": [{"type": "public-key", "id": c} for c in have],
+            "attestation": "none", "timeout": 120000}
+
+
+@app.post("/v1/devices/register/finish")
+def device_register_finish(body: DeviceFinishIn, request: Request, who: str = Depends(person)):
+    import passkeys
+    _approver(who)
+    try:
+        passkeys.check_registration_challenge(_link_secret(), who, body.challenge)
+        dev = passkeys.register(credential_id=body.credential_id, client_data_json=body.client_data_json,
+                                attestation_object=body.attestation_object, challenge=body.challenge, rp_id=_rp_id(request))
+    except passkeys.PasskeyError as e:
+        raise HTTPException(400, f"couldn't add this device: {e}")
+    with audited_tx() as conn:
+        if conn.execute(select(devices.c.credential_id).where(devices.c.credential_id == dev["credential_id"])).first():
+            raise HTTPException(409, "this device is already registered")
+        conn.execute(devices.insert().values(credential_id=dev["credential_id"], person=who, name=body.name.strip()[:100],
+                                             created_at=utcnow(), public_key=json.dumps(dev["public_key"]),
+                                             sign_count=dev["sign_count"]))
+        audit(conn, who, "device.added", body.name.strip()[:100], credential_id=dev["credential_id"],
+              public_key=dev["public_key"])
+    return {"added": body.name, "credential_id": dev["credential_id"]}
+
+
+@app.get("/v1/devices")
+def device_list(who: str = Depends(person)):
+    with engine.connect() as conn:
+        q = select(devices).order_by(devices.c.created_at)
+        rows = conn.execute(q if keystore.is_admin(who) else q.where(devices.c.person == who)).all()
+    return {"devices": [{k: getattr(r, k) for k in ("credential_id", "person", "name", "created_at", "last_used_at")}
+                        for r in rows], "required": bool(settings().get("require_device_signature"))}
+
+
+@app.delete("/v1/devices/{credential_id}")
+def device_remove(credential_id: str, who: str = Depends(person)):
+    with audited_tx() as conn:
+        row = conn.execute(select(devices).where(devices.c.credential_id == credential_id)).first()
+        if row is None:
+            raise HTTPException(404, "no such device")
+        if row.person != who and not keystore.is_admin(who):
+            raise HTTPException(403, "only its owner or an admin can remove a device")
+        conn.execute(delete(devices).where(devices.c.credential_id == credential_id))
+        audit(conn, who, "device.removed", row.name, credential_id=credential_id, person=row.person)
+    return {"removed": credential_id}
+
+
+def _challenge(event_id: str, outcome: str, approver: str, request: Request) -> dict:
+    import passkeys
+    with engine.connect() as conn:
+        creds = [r[0] for r in conn.execute(select(devices.c.credential_id).where(devices.c.person == approver)).all()]
+    text_ = passkeys.statement(event_id, outcome)
+    return {"statement": text_, "challenge": passkeys.challenge_of(text_), "rp_id": _rp_id(request),
+            "allow_credentials": creds, "required": bool(settings().get("require_device_signature"))}
+
+
+@app.post("/v1/events/{event_id}/challenge")
+def event_challenge(event_id: str, body: ChallengeIn, request: Request, who: str = Depends(person)):
+    """What to sign with a passkey to approve or reject this event: the page asks the device, then sends the result
+    with the decision (device_proof)."""
+    return _challenge(event_id, body.outcome, _approver(who), request)
 
 
 # ---- reports + audit
@@ -2654,6 +3448,16 @@ def build_evidence(days: int, who: str) -> dict:
                                 .where(policy_versions.c.first_seen >= since)).scalar() or 0
         decided = conn.execute(select(events.c.client, events.c.decided_by).where(
             events.c.created_at >= since, events.c.decided_by.isnot(None), events.c.decided_by != "timeout")).all()
+        signed = conn.execute(select(func.count()).where(events.c.created_at >= since,
+                                                         events.c.decided_with.isnot(None))).scalar() or 0
+        snaps = conn.execute(select(events.c.snapshot).where(events.c.created_at >= since,
+                                                             events.c.snapshot.isnot(None))).all()
+        proofs = dict(conn.execute(select(events.c.proof_status, func.count()).where(
+            events.c.created_at >= since, events.c.proof_status.isnot(None)).group_by(events.c.proof_status)).all())
+        n_checkpoints = conn.execute(select(func.count()).select_from(audit_checkpoints)).scalar() or 0
+        n_devices = conn.execute(select(func.count()).select_from(devices)).scalar() or 0
+    kept = sum(1 for (x,) in snaps if '"id"' in x)
+    skipped = sum(1 for (x,) in snaps if '"skipped"' in x)
     members = keystore.listing() if keystore.enabled else []
     owners = {m["name"]: m.get("owner") for m in members if m["kind"] == "agent"}
     sp = {"enforced": bool(settings().get("second_person")), "decided": len(decided),
@@ -2673,7 +3477,18 @@ def build_evidence(days: int, who: str) -> dict:
             "team": {"people": len(people), "approvers": sum(1 for m in people if m["approver"]),
                      "admins": sum(1 for m in people if "admin" in m["roles"]), "agents": len(owners),
                      "agents_with_owner": sum(1 for o in owners.values() if o)},
-            "changes": {"entries": changes, "stops": sum(1 for c in changes if c["action"] == "controls.stopped")}}
+            "changes": {"entries": changes, "stops": sum(1 for c in changes if c["action"] == "controls.stopped")},
+            "controls": {"snapshots": policy.snapshots, "snapshots_kept": kept, "snapshots_skipped": skipped,
+                         "when_unreachable": policy.when_unreachable,
+                         "allow_while_unreachable": sum(1 for r in policy.rules if r["when_unreachable"] == "allow"),
+                         "checkpoints": n_checkpoints, "ledger_key": ledger_public()["public_key"],
+                         "devices": n_devices, "device_signed": signed,
+                         "device_required": bool(settings().get("require_device_signature")),
+                         "budgets": len(policy.budgets), "proof_checks": len(policy.proofs),
+                         "proofs": {"confirmed": proofs.get("confirmed", 0), "mismatch": proofs.get("mismatch", 0),
+                                    "error": proofs.get("error", 0)},
+                         "redaction": "secrets, emails and card numbers masked before storage" if REDACT_PERSONAL
+                                      else "secrets masked before storage"}}
 
 
 @app.get("/v1/audit/evidence-pack")
@@ -2710,10 +3525,16 @@ def evidence_body(who: str) -> dict:
         evs = [dict(r._mapping) for r in conn.execute(select(*[events.c[c] for c in EXPORT_COLUMNS])
                                                       .order_by(events.c.created_at)).all()]
         policies = {r.fingerprint: r.content for r in conn.execute(select(policy_versions)).all()}
+        cps = checkpoint_rows(conn)
+        devs = [{"credential_id": r.credential_id, "person": r.person, "name": r.name, "public_key": r.public_key}
+                for r in conn.execute(select(devices)).all()]
+    key = ledger_public()
     return {"format": verify.FORMAT, "generated_at": utcnow(), "generated_by": who,
             "head_hash": entries[-1]["hash"] if entries else GENESIS, "entries": entries, "events": evs,
-            "policies": policies,
-            "how_to_check": "python verify.py this-file.json   (verify.py is in the Squidbrake repository)"}
+            "policies": policies, "checkpoints": cps, "ledger_key": key, "devices": devs,
+            "how_to_check": f"python verify.py this-file.json --key {key['public_key']}   (verify.py and signing.py are "
+                            "in the Squidbrake repository; check the key against the one this gateway publishes at "
+                            "/v1/audit/public-key)"}
 
 
 def s3_archive(cfg: dict | None = None, force: bool = False) -> str | None:
@@ -2745,6 +3566,23 @@ async def _s3_loop():
         except Exception:
             log.exception("S3 archive failed (the evidence file wasn't uploaded; it tries again in an hour)")
         await asyncio.sleep(3600)
+
+
+@app.get("/v1/audit/public-key")
+@app.get("/.well-known/squidbrake-ledger-key.json", include_in_schema=False)
+def audit_public_key():
+    """The public half of the key that signs audit checkpoints. Public on purpose: publish it (your site, your security
+    page, a ticket with your auditor) so anyone can check an export with `verify.py --key`."""
+    with engine.connect() as conn:
+        last = conn.execute(select(audit_checkpoints).order_by(audit_checkpoints.c.seq.desc()).limit(1)).first()
+    return {**ledger_public(), "latest_checkpoint": dict(last._mapping) if last else None}
+
+
+@app.get("/v1/audit/checkpoints")
+def audit_checkpoint_list(limit: int = Query(50, ge=1, le=1000), _: str = Depends(person)):
+    with engine.connect() as conn:
+        rows = conn.execute(select(audit_checkpoints).order_by(audit_checkpoints.c.seq.desc()).limit(limit)).all()
+    return {"key": ledger_public(), "checkpoints": [dict(r._mapping) for r in rows]}
 
 
 @app.get("/v1/audit/log")
@@ -2853,6 +3691,8 @@ def list_events(
         stmt = stmt.where(events.c.created_at < before)
     with engine.connect() as conn:
         rows = [row_to_dict(r) for r in conn.execute(stmt)]
+    for d in rows:      # lists show previews; one event (GET /v1/events/{id}) has the whole stored copy
+        d["input"], d["output"] = preview_of(d["input"]), preview_of(d["output"])
     return {"events": rows, "next_before": rows[-1]["created_at"] if len(rows) == limit else None}
 
 
@@ -2976,6 +3816,29 @@ async def proxy(upstream: str, path: str, request: Request, client: str = Depend
                             headers={"X-Gateway-Event-Id": decision.event_id})
 
     url = f"{base}/{path}" + (f"?{request.url.query}" if request.url.query else "")
+    if decision.snapshot and request.method in ("PUT", "PATCH", "DELETE"):
+        # Undo for an API: read the record as it is now (the same URL, the same credentials), keep it, then change it.
+        why = None
+        try:
+            before = await request.app.state.http.get(url, headers={k: v for k, v in fwd_headers.items()
+                                                                     if k.lower() not in ("content-type",)})
+            if 200 <= before.status_code < 300:
+                await run_in_threadpool(save_snapshot, decision.event_id, SnapshotIn(
+                    kind="http", ref=f"GET {upstream}/{path}", summary=f"{upstream}/{path} as it was before the "
+                    f"{request.method}", data=_body_preview(before.content)), client)
+            else:
+                why = f"reading {upstream}/{path} first returned {before.status_code}"
+        except (httpx.HTTPError, HTTPException) as e:
+            why = f"couldn't read {upstream}/{path} first ({getattr(e, 'detail', None) or type(e).__name__})"
+        if why:
+            await run_in_threadpool(save_snapshot, decision.event_id, SnapshotIn(skipped=why), client)
+            if decision.snapshot == "required":
+                await run_in_threadpool(complete_event, decision.event_id,
+                                        ResultIn(error=f"not run: no undo copy could be made ({why})"))
+                return JSONResponse(status_code=403, headers={"X-Gateway-Event-Id": decision.event_id}, content={
+                    "event_id": decision.event_id, "decision": "deny",
+                    "reason": f"Squidbrake keeps a copy before this kind of change and couldn't ({why}), so it "
+                              "didn't run. Set snapshot: best_effort on the rule to allow it without one."})
     t0 = time.perf_counter()
     try:
         resp = await request.app.state.http.request(request.method, url, headers=fwd_headers, content=body)

@@ -105,6 +105,22 @@ def _snapshot(line: str, cwd: str) -> dict | None:
                 git_repos.append(cwd)
         else:
             paths += [p for p in effects.delete_targets(cmd, cwd) if not _regenerable(p)]
+    return _keep(paths, git_repos, cwd, line)
+
+
+def snapshot_files(paths: list[str], cwd: str | None = None, what: str = "edit") -> dict | None:
+    """Back up files an agent is about to overwrite or edit (Claude Code's Write / Edit). Files that don't exist yet
+    have nothing to keep. Never raises; restore with `squidbrake undo ID --force` (the file exists again)."""
+    try:
+        cwd = cwd or os.getcwd()
+        found = [p for p in (Path(cwd) / x if not Path(x).is_absolute() else Path(x) for x in paths if x)
+                 if p.is_file() and not p.is_symlink()]
+        return _keep(found, [], cwd, f"{what}: {', '.join(str(p) for p in found)}") if found else None
+    except Exception as e:  # pragma: no cover - best effort by design
+        return {"skipped": f"backup failed ({e.__class__.__name__})"}
+
+
+def _keep(paths: list[Path], git_repos: list[str], cwd: str, line: str) -> dict | None:
     if not paths and not git_repos:
         return None
     files, size, complete = effects.walk(paths, time.monotonic() + 5)
