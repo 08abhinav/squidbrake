@@ -49,7 +49,7 @@ try:
                               "scam wire after the look-alike CEO email is blocked by the gateway itself"))
             wire = httpx.get(f"{URL}/v1/events", headers=A, params={"name": "acme.payments_transfer"}).json()["events"][0]
             steps = httpx.get(f"{URL}/v1/events/{wire['id']}/context", headers=A).json()["steps"]
-            results.append(ok(any("ceo.office@acrne-corp.com" in (s["output"] or "") for s in steps), "the story shows the email that asked for it"))
+            results.append(ok(any("@acrne-corp.com" in (s["output"] or "") and "ceo.office@" not in (s["output"] or "") for s in steps), "the story shows the email that asked for it (sender masked, domain kept)"))
 
             await c.call_tool("inbox_read", {"message_id": "msg_1"})
             r = await c.call_tool("payments_refund", {"charge_id": "ch_1002", "amount": 49.0, "reason": "duplicate charge"})
