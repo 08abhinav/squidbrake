@@ -3,20 +3,40 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Install Squidbrake</title>
+<title>Squidbrake: agents propose, people approve</title>
+<meta name="description" content="Squidbrake checks what your AI coding agents do before it happens. Everyday work runs on its own; what can't be undone waits for a person. Free and open source.">
 <style>
-:root { --bg:#fafaf9; --card:#fff; --ink:#18181b; --muted:#71717a; --line:#e4e4e7; --code:#f4f4f5; --accent:#dc2626; }
-@media (prefers-color-scheme: dark) { :root { --bg:#111114; --card:#1a1a1f; --ink:#f4f4f5; --muted:#a1a1aa; --line:#2e2e35;
-        --code:#232329; --accent:#ef4444; } }
+:root { --bg:#fafaf9; --card:#fff; --ink:#18181b; --muted:#6b6b73; --line:#e4e4e7; --code:#f4f4f5; --accent:#e5531f;
+        --ok:#16803c; --shadow:0 1px 2px rgba(0,0,0,.04), 0 10px 30px -14px rgba(0,0,0,.18); }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f0f11; --card:#18181c; --ink:#f2f2f3; --muted:#a1a1aa; --line:#2a2a30;
+        --code:#202026; --accent:#f06a2f; --ok:#3fbf6c; --shadow:0 1px 2px rgba(0,0,0,.4), 0 12px 30px -14px rgba(0,0,0,.7); } }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
-main { max-width:720px; margin:0 auto; padding:40px 16px 64px; }
+main { max-width:760px; margin:0 auto; padding:36px 16px 64px; }
+a { color:var(--accent); }
+.top { display:flex; align-items:center; gap:10px; }
 .brand { font-weight:800; font-size:20px; letter-spacing:-.01em; } .brand span { color:var(--accent); }
-h1 { font-size:32px; line-height:1.2; margin:18px 0 8px; letter-spacing:-.02em; }
-.lead { color:var(--muted); margin:0 0 24px; font-size:17px; }
-.card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; margin:0 0 14px; }
-.card h2 { font-size:17px; margin:0 0 4px; } .card p { margin:4px 0; color:var(--muted); font-size:15px; }
-.tabs { display:flex; gap:6px; margin:4px 0 10px; flex-wrap:wrap; }
+.top .gh { margin-left:auto; font-size:14px; color:var(--muted); text-decoration:none; border:1px solid var(--line);
+           border-radius:999px; padding:5px 12px; background:var(--card); }
+.top .gh:hover { color:var(--ink); }
+h1 { font-size:40px; line-height:1.1; margin:26px 0 10px; letter-spacing:-.025em; }
+.lead { color:var(--muted); margin:0 0 22px; font-size:18px; max-width:640px; }
+.ctas { display:flex; gap:10px; flex-wrap:wrap; margin:0 0 26px; }
+.btn { display:inline-flex; align-items:center; gap:8px; padding:11px 18px; border-radius:11px; font-weight:600; font-size:15px;
+       text-decoration:none; border:1px solid var(--line); background:var(--card); color:var(--ink); }
+.btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+.btn small { font-weight:500; opacity:.8; }
+.demo { border-radius:16px; overflow:hidden; border:1px solid var(--line); box-shadow:var(--shadow); background:var(--card); margin:0 0 26px; }
+.demo img { display:block; width:100%; height:auto; }
+.demo figcaption { font-size:13.5px; color:var(--muted); padding:10px 14px; border-top:1px solid var(--line); }
+.points { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; margin:0 0 26px; }
+@media (max-width:640px) { .points { grid-template-columns:1fr; } h1 { font-size:30px; } }
+.pt { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:var(--shadow); }
+.pt b { display:block; font-size:15px; margin-bottom:4px; } .pt span { color:var(--muted); font-size:14px; }
+.pt code { font-size:12.5px; background:var(--code); padding:1px 5px; border-radius:5px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:20px; margin:0 0 14px; box-shadow:var(--shadow); }
+.card h2 { font-size:18px; margin:0 0 4px; } .card p { margin:4px 0; color:var(--muted); font-size:15px; }
+.tabs { display:flex; gap:6px; margin:10px 0 10px; flex-wrap:wrap; }
 .tabs button { border:1px solid var(--line); background:var(--code); color:var(--ink); border-radius:999px; padding:5px 12px;
                font:inherit; font-size:14px; cursor:pointer; }
 .tabs button[aria-selected="true"] { background:var(--ink); color:var(--bg); border-color:var(--ink); }
@@ -25,43 +45,73 @@ h1 { font-size:32px; line-height:1.2; margin:18px 0 8px; letter-spacing:-.02em; 
        white-space:pre-wrap; word-break:break-all; }
 .copy { position:absolute; top:8px; right:8px; border:1px solid var(--line); background:var(--card); color:var(--ink);
         border-radius:8px; padding:4px 10px; font:13px system-ui,sans-serif; cursor:pointer; }
-ul { margin:6px 0 0; padding-left:20px; color:var(--muted); font-size:15px; } li { margin:3px 0; }
+ul { margin:8px 0 0; padding-left:20px; color:var(--muted); font-size:15px; } li { margin:3px 0; }
+.proof { border-left:3px solid var(--ok); }
 .foot { color:var(--muted); font-size:14px; margin-top:22px; }
-a { color:var(--accent); }
-@media (max-width:560px) { h1 { font-size:26px; } }
 </style>
 </head>
 <body>
 <main>
-  <div class="brand">Squid<span>brake</span></div>
-  <h1>Agents propose. People approve.</h1>
-  <p class="lead">Squidbrake checks what your AI coding agents do before it happens. Everyday work runs on its own;
-    what can't be undone (force pushes, deletes, destructive SQL, cloud deletes) waits for a person.</p>
+  <div class="top"><div class="brand">Squid<span>brake</span></div>
+    <a class="gh" href="https://github.com/batrapulkit/squidbrake" rel="noopener">★ GitHub · open source</a></div>
 
-  <div class="card">
+  <h1>Agents propose.<br>People approve.</h1>
+  <p class="lead">Your AI coding agents run commands, push code and change databases. Squidbrake checks every action
+    before it happens: everyday work runs on its own, and anything you can't undo waits for a person.</p>
+
+  <div class="ctas">
+    <a class="btn primary" href="https://codespaces.new/batrapulkit/squidbrake?quickstart=1" rel="noopener">▶ Try it in your browser <small>nothing to install</small></a>
+    <a class="btn" href="#install">Install in one line ↓</a>
+  </div>
+
+  <figure class="demo">
+    <img src="https://raw.githubusercontent.com/batrapulkit/squidbrake/main/docs/demo.gif" alt="An agent's actions go on the record; a risky one waits for a person and is approved from a phone" loading="eager">
+    <figcaption>A risky action waits, a person approves it from their phone, and the record shows who asked, who approved and what led to it.</figcaption>
+  </figure>
+
+  <div class="points">
+    <div class="pt"><b>Holds what can't be undone</b><span><code>git push --force</code>, <code>rm -r</code>, <code>DROP TABLE</code>,
+      <code>terraform destroy</code> wait for a person. Wiping a disk or your home folder is blocked.</span></div>
+    <div class="pt"><b>Shows what it will change</b><span>"removes 3 commits from origin/main", "deletes 1,204 files", "deletes 4,312
+      rows of 10,240". Approved a delete? <code>squidbrake undo</code> puts it back.</span></div>
+    <div class="pt"><b>One policy, every agent</b><span>Claude Code, Cursor, Codex, Gemini CLI, VS Code Copilot, Antigravity and your
+      MCP tools. Plain YAML rules, no LLM in the decision.</span></div>
+  </div>
+
+  <div class="card proof">
+    <h2>Checked against real incidents</h2>
+    <p>Replit's agent deleting a production database, Claude Code wiping a home folder, Antigravity wiping a drive, GitHub and
+      Supabase MCP leaks: each is replayed against the shipped rules in CI. See what it stops, and the one it doesn't:
+      <a href="https://github.com/batrapulkit/squidbrake/tree/main/incidents" rel="noopener">incidents</a>.</p>
+  </div>
+
+  <div class="card" id="install">
     <h2>Install</h2>
-    <p>One line. It installs Squidbrake, connects the agents on this computer and opens the dashboard.</p>
+    <p>One line. It installs Squidbrake, connects the agents on this computer and opens the dashboard. Then ask your agent
+      to run <code>rm -rf ~/</code> and watch it get blocked.</p>
     <div class="tabs" role="tablist" id="tabs"></div>
     <div class="cmd" id="cmd"><button class="copy" id="copy">Copy</button><span id="text"></span></div>
     <ul>
-      <li>Works with Claude Code, Cursor, Codex, Gemini CLI, VS Code and Antigravity.</li>
-      <li>Runs on your computer. The first time, it asks whether to send anonymous usage stats; you can say no.</li>
+      <li>Runs on your computer: your commands, files and prompts stay there.</li>
+      <li>The first time, it asks whether to send anonymous usage stats; you can say no.</li>
+      <li>Free and open source (Apache 2.0). <code>squidbrake connect all --remove</code> takes it out of every agent.</li>
     </ul>
   </div>
 
-  <p class="foot">Open source: <a href="https://github.com/batrapulkit/squidbrake" rel="noopener">github.com/batrapulkit/squidbrake</a>.
-    Setting it up for a team? <a href="/team?from=site">Tell us about it</a>.</p>
+  <p class="foot">Rolling it out to a team (a second person signs off, an evidence pack for your auditor)?
+    <a href="/team?from=site">Tell us about it</a> and we'll help set it up.</p>
 </main>
 <script>
 const D = __DATA__;
 const ref = D.ref;
+const win = navigator.platform.startsWith("Win");
 const OPTIONS = {
   "macOS / Linux": `curl -fsSL ${D.server}/install.sh | ${ref ? `SQUIDBRAKE_REF=${ref} ` : ""}sh`,
   "Windows": `${ref ? `$env:SQUIDBRAKE_REF="${ref}"; ` : ""}irm ${D.server}/install.ps1 | iex`,
-  "pip": `pip install squidbrake\n${ref ? (navigator.platform.startsWith("Win") ? `$env:SQUIDBRAKE_REF="${ref}"; squidbrake setup` : `SQUIDBRAKE_REF=${ref} squidbrake setup`) : "squidbrake setup"}`,
+  "pip": `pip install squidbrake\n${ref ? (win ? `$env:SQUIDBRAKE_REF="${ref}"; squidbrake setup` : `SQUIDBRAKE_REF=${ref} squidbrake setup`) : "squidbrake setup"}`,
 };
 const tabs = document.getElementById("tabs"), text = document.getElementById("text");
-let current = navigator.platform.startsWith("Win") ? "Windows" : "macOS / Linux";
+let current = win ? "Windows" : "macOS / Linux";
 function show(name) {
   current = name;
   text.textContent = OPTIONS[name];
