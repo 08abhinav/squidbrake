@@ -112,6 +112,7 @@ ask one to run `rm -rf ~/` and watch it get blocked. `squidbrake connect status`
 catches the one step people miss (Codex runs a new hook only after you approve it in `/hooks`).
 
 Your rules, keys and data live in `~/.squidbrake`; edit `~/.squidbrake/rules.yaml` and changes apply at once.
+If the first run does not look right, see the [first-10-minutes troubleshooting guide](docs/troubleshooting.md).
 
 Only Claude Code? It's also a plugin, installed from inside Claude Code (see [plugin/](plugin/)):
 `/plugin marketplace add batrapulkit/squidbrake`, then `/plugin install squidbrake@squidbrake`.
