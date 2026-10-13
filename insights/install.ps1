@@ -6,7 +6,14 @@
 #   2. otherwise                     -> uv, which brings its own Python (uv is installed first if it isn't here)
 # Running it again upgrades Squidbrake in place, the same way it was installed: the agents' hooks run that copy, so
 # a failed upgrade (offline, a proxy) leaves the working one as it was.
-$ErrorActionPreference = "Continue"
+#
+# Everything below runs inside "& { ... }": this script is piped to iex, i.e. it runs in the user's own PowerShell
+# window, and a script block gives it its own scope. $ErrorActionPreference, $app, $bin, $sb, the helper functions
+# and the rest vanish when it ends. The only things meant to outlive it are the user's PATH (so `squidbrake` is
+# found) and the $env:SQUIDBRAKE_* inputs it reads; the UV_* variables it sets for pip/uv are put back in the
+# `finally` at the bottom.
+& {
+$ErrorActionPreference = "Continue"   # local to this block: the caller's setting is untouched
 Write-Host "`nInstalling Squidbrake (brakes for AI agents)...`n" -ForegroundColor Cyan
 function Fail($msg) { Write-Host "`n  [X] $msg`n" -ForegroundColor Red; OfferReport $msg; throw "Squidbrake install stopped" }
 # Asks first ([y/N], Enter is no; never without a keyboard), then sends only the lines shown above as "What it
@@ -50,6 +57,14 @@ if ($ExecutionContext.SessionState.LanguageMode -ne "FullLanguage") {
     Write-Host "      installed from here. Ask IT to allow it, or install it with:  pip install squidbrake`n" -ForegroundColor Red
     return
 }
+
+# The UV_* variables this script sets (for pip/uv, below) must not stay behind in the user's window: remember what
+# they were (usually nothing) and put them back in the `finally` that closes the try opened here. Every `return`
+# below, including the ones in the catch, goes through it. The try body is left un-indented to keep the diff small.
+$uvNames = "UV_NATIVE_TLS", "UV_NO_MODIFY_PATH", "UV_INSTALL_DIR", "UV_TOOL_BIN_DIR"
+$uvWas = @{}
+foreach ($n in $uvNames) { $uvWas[$n] = (Get-Item -Path "Env:$n" -ErrorAction SilentlyContinue).Value }
+try {
 
 $app = if ($env:SQUIDBRAKE_APP_DIR) { $env:SQUIDBRAKE_APP_DIR } else { Join-Path $env:USERPROFILE ".squidbrake\app" }
 $bin = if ($env:SQUIDBRAKE_BIN_DIR) { $env:SQUIDBRAKE_BIN_DIR } else { Join-Path $env:USERPROFILE ".local\bin" }
@@ -259,3 +274,12 @@ Write-Host "     It prints your keys (save them) and opens the dashboard. It ask
 Write-Host "     background and at every login. Say yes: if it isn't running, your agents' actions are blocked until it is."
 Write-Host "  2. In another PowerShell window, connect your agents:  squidbrake connect all"
 Write-Host "  3. Restart your agents and work as usual. Watch it at http://localhost:8080/dashboard`n"
+
+} finally {
+    # UV_* back to what they were before the installer ran (removed if they weren't set); PATH is left as updated above
+    foreach ($n in $uvNames) {
+        if ($null -ne $uvWas[$n]) { Set-Item -Path "Env:$n" -Value $uvWas[$n] }
+        else { Remove-Item -Path "Env:$n" -ErrorAction SilentlyContinue }
+    }
+}
+}

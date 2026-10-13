@@ -3,6 +3,7 @@ codes), the hooks an install writes, the first run, and the installers' text, ea
 (install.sh runs for real in test_install_sh.py.)"""
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -317,3 +318,24 @@ def test_install_ps1_asks_before_sending_a_failed_install():
     assert "OfferReport $msg" in PS1 and "[y/N]" in PS1 and "IsInputRedirected" in PS1
     assert "[regex]::Escape($env:USERPROFILE)" in PS1 and "-Tail 15" in PS1
     assert PS1.index("function OfferReport") < PS1.index("try {")
+
+
+def _ps1_code(text):
+    return [l.strip() for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+
+def test_install_ps1_body_is_wrapped_in_a_script_block():
+    """irm | iex runs it in the founder's own PowerShell window: its variables, functions and
+    $ErrorActionPreference must be gone when it ends."""
+    code = _ps1_code(PS1)
+    assert code[0] == "& {" and code[-1] == "}"                        # nothing but comments runs outside the block
+    assert code[1].startswith('$ErrorActionPreference = "Continue"')   # set inside it, so it stays local
+
+
+def test_install_ps1_puts_the_uv_variables_back():
+    set_names = set(re.findall(r"\$env:(UV_\w+)\s*=", PS1))
+    assert set_names == {"UV_NATIVE_TLS", "UV_NO_MODIFY_PATH", "UV_INSTALL_DIR", "UV_TOOL_BIN_DIR"}
+    saved = re.search(r"\$uvNames\s*=\s*(.+)", PS1).group(1)
+    assert all(f'"{n}"' in saved for n in set_names)                   # every one it sets is on the restore list
+    assert PS1.index("$uvWas[$n] =") < PS1.index("$env:UV_NATIVE_TLS =")   # remembered before the first is set
+    assert PS1.rindex("} finally {") > PS1.index("& $sb setup")        # restored after the last thing that runs
