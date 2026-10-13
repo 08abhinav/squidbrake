@@ -137,12 +137,14 @@ def claude_code(args) -> None:
         print("Removed. Restart Claude Code to apply.")
         return
 
+    brief = getattr(args, "brief", False)      # inside `connect all`: one line per agent, the rest is said once
     where = f"the project {Path(args.project).resolve()}" if args.project else "ALL your Claude Code projects"
     tools = "" if args.hook_only else ",\nand adds database tools"
-    print(f"This routes every Claude Code tool call in {where} through the gateway at {args.url}{tools}.\n"
-          f"It changes {path} (a backup is kept).")
-    if not confirm("Continue?", args.yes):
-        return
+    if not brief:
+        print(f"This routes every Claude Code tool call in {where} through the gateway at {args.url}{tools}.\n"
+              f"It changes {path} (a backup is kept).")
+        if not confirm("Continue?", args.yes):
+            return
     key = args.key or previous_key(settings, args.url) or new_key("claude-code", args.url)
 
     hook_cmd = {"type": "command", "command": PYTHON,
@@ -159,6 +161,9 @@ def claude_code(args) -> None:
     if path.exists():
         shutil.copy2(path, path.with_name(f"settings.json.bak-{time.strftime('%Y%m%d-%H%M%S')}"))
     path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    if brief:
+        print(f"claude-code: hook added (every tool call) in {path}, backup kept")
+        return
     print(f"Added the hook to {path}")
     if args.hook_only:
         print(f"\nDone. Restart Claude Code; every tool call now goes through {args.url}/dashboard")
@@ -331,7 +336,8 @@ def guard(args) -> None:
     targets = [(a, path, key_name) for a, files in configs.items() if args.agent in ("all", a)
                for path, key_name in files if path.exists()]
     if not targets:
-        print("No MCP configs found for: " + ", ".join(configs if args.agent == "all" else [args.agent]))
+        print("mcp servers: none of your agents has any configured, nothing to guard" if getattr(args, "brief", False)
+              else "No MCP configs found for: " + ", ".join(configs if args.agent == "all" else [args.agent]))
         return
     keys: dict[str, str] = {}
     for agent, path, key_name in targets:
@@ -385,7 +391,7 @@ def guard(args) -> None:
             saved_path.unlink(missing_ok=True)
         else:
             saved_path.write_text(json.dumps(saved, indent=2), encoding="utf-8")
-        print(f"{agent}: {', '.join(changed)} {note}. Restart {agent} to apply.")
+        print(f"{agent}: {', '.join(changed)} {note}." + ("" if getattr(args, "brief", False) else f" Restart {agent} to apply."))
 
 
 # --------------------------------------------------------------------------- hooks for the other coding agents
@@ -531,7 +537,7 @@ def agents(args) -> None:
         cmd = " ".join([_word(PYTHON), _word(str(AGENT_HOOK)), name, "--url", args.url, "--key", key])
         t["edit"](data, cmd)
         _write_json(t["file"], data)
-        print(f"{name}: hook added ({t['covers']}). Restart {name} to apply.")
+        print(f"{name}: hook added ({t['covers']})" + ("" if getattr(args, "brief", False) else f". Restart {name} to apply."))
         if name == "codex" and codex_hook_trust() != "trusted":
             print(CODEX_UNTRUSTED)
 
@@ -958,58 +964,86 @@ def connect_all(args) -> None:
         sys.exit(f"unknown agent {', '.join(bad)}; pick from: {', '.join(sorted(known))}")
     claude = (bool(shutil.which("claude")) or (Path.home() / ".claude").exists()) and (not only or "claude-code" in only)
     others = [a for a in only if a != "claude-code"]
-    if only and not args.remove:
-        print(f"Only: {', '.join(only)} (the other agents here are left as they are)")
+    steps = getattr(args, "steps", True)       # `squidbrake setup` runs this as one of its own steps: no header
     if not args.remove:
-        print(f"This sends what every AI agent on this computer does through the gateway at {args.url}:\n"
+        if steps:
+            import flow
+            flow.header(2)
+        if only:
+            print(f"Only: {', '.join(only)} (the other agents here are left as they are)")
+        print(f"\nThis routes what every AI agent on this computer does through the gateway at {args.url}:\n"
               f"  - Claude Code: {'every tool call' if claude else 'not found, skipped'}\n"
               "  - Cursor, Codex, Gemini CLI, VS Code Copilot, Antigravity (the ones installed): commands, reads and edits\n"
               "  - the MCP servers those agents already use\n"
               "Every config is backed up first; `connect all --remove` undoes it all.")
         if not confirm("Continue?", args.yes):
             return
+        print()
+    # The first keys are made now and shown at the end, after the agents, where they're easy to find and copy
+    created = None if args.remove else _first_keys(args.url)
     each = argparse.Namespace(url=args.url, key=args.key, remove=args.remove, yes=True, agent="all",
-                              project=None, hook_only=True)
-    if claude:
-        print("\nClaude Code")
-        claude_code(each)
-    if not only:
-        print("\nOther coding agents")
-        agents(each)
-        print("\nMCP servers")
-        guard(each)
-    for name in others:
-        print(f"\n{name}")
-        agents(argparse.Namespace(**{**vars(each), "agent": name}))
-        if name in ("cursor", "vscode", "gemini-cli", "antigravity"):         # its MCP servers too
-            guard(argparse.Namespace(**{**vars(each), "agent": name}))
+                              project=None, hook_only=True, brief=not args.remove)
+    try:
+        if claude:
+            claude_code(each)
+        if not only:
+            agents(each)
+            guard(each)
+        for name in others:
+            agents(argparse.Namespace(**{**vars(each), "agent": name}))
+            if name in ("cursor", "vscode", "gemini-cli", "antigravity"):         # its MCP servers too
+                guard(argparse.Namespace(**{**vars(each), "agent": name}))
+    finally:
+        if created:                              # whatever stopped it, the keys are shown: they're shown only once
+            import server
+            server.print_banner(None, created)
     if args.remove:
         return
     print(f"\nUsing Squidbrake with a team? Tell us about it and we'll help you set it up: {TEAM_FORM}?from=cli"
           f"\n(or 15 minutes with the founder: {FOUNDER_CALL})")
-    if not args.yes and sys.stdin.isatty():
-        offer_counts()
+    if steps:
+        _next_step(args.url)
 
 
 # Only printed, never opened or sent: the team can't see who installs, so this is how people can find us
 FOUNDER_CALL = "https://calendly.com/pulkitbatra2024/new-meeting-1"
 TEAM_FORM = "https://pilots.squidbrake.com/team"
 
-# Counts from installs that aren't pilots: asked once, default no, never in scripts (--yes) or without a terminal
-COMMUNITY_SERVER, COMMUNITY_CODE = "https://pilots.squidbrake.com", "community-opt-in-ins-a42929"
 
-
-def offer_counts() -> None:
-    import pilot
+def _first_keys(url: str) -> dict[str, str] | None:
+    """Connecting before the gateway's first start: make its first keys now (new_key would otherwise print them
+    in the middle of the agents). None when they exist, or are made elsewhere (a hosted gateway, GATEWAY_API_KEYS)."""
+    if not url.startswith(LOCAL_URLS):
+        return None
     import server
-    asked = server.PILOT_DIR / "community-asked"
-    if pilot.load(server.PILOT_DIR) or asked.exists():       # already sharing (e.g. a pilot), or asked before
-        return
-    print("\nOne optional thing: the Squidbrake team can't see installs like this one, only pilots.")
-    pilot.join(server.PILOT_DIR, COMMUNITY_CODE, COMMUNITY_SERVER, False, server.VERSION)
-    asked.parent.mkdir(parents=True, exist_ok=True)
-    asked.write_text("asked once; to share later: squidbrake pilot join " + COMMUNITY_CODE +
-                     " --server " + COMMUNITY_SERVER + "\n", encoding="utf-8")
+    if server.keystore.from_env or server.keystore.disabled:
+        return None
+    return server.keystore.ensure_initialized()
+
+
+def gateway_up(url: str) -> bool:
+    try:
+        return _get(url, f"{url}/health", timeout=3).status_code == 200
+    except Exception:
+        return False
+
+
+def _next_step(url: str) -> None:
+    """The last thing `connect all` prints: the agents are connected, but blocked until the gateway runs.
+    The step people forget is starting it, so that's said last, on its own."""
+    import flow
+    restart = "Then quit and reopen your agents (Claude Code, Cursor, Codex, ...): they pick the hook up on start."
+    if gateway_up(url):
+        flow.next_step(["Your agents are connected, and the gateway is running at " + url + ".", "",
+                        "Last step: quit and reopen your agents (Claude Code, Cursor, Codex, ...), then work as usual.",
+                        "Check everything end to end:  " + flow.doctor_command()])
+    elif url.startswith(LOCAL_URLS):
+        flow.next_step(["Your agents are connected. The gateway isn't running yet: until it is, their tool calls are",
+                        "blocked.", "",
+                        "Next, step 3 of 3, in this window:   " + flow.start_command(), "", restart])
+    else:
+        flow.next_step([f"Your agents are connected, but the gateway at {url} isn't answering: until it is, their",
+                        "tool calls are blocked. Ask whoever runs it.", "", restart])
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -332,8 +332,8 @@ def _interactive() -> bool:
 
 
 def _ask(kind: str) -> bool | None:
-    print("\nSquidbrake can keep running in the background, so your agents are never blocked because it's down.")
-    print(f"That adds {_where(kind)},")
+    print("\nOne question. Squidbrake can keep running in the background, so your agents are never blocked because")
+    print(f"it's down. That adds {_where(kind)},")
     print("which starts it at every login and again if it stops. Turn it off any time: " + _cli("stop"))
     try:
         answer = input("Run Squidbrake in the background? [y/N] ").strip().lower()
@@ -342,7 +342,8 @@ def _ask(kind: str) -> bool | None:
         return None
     if answer not in ("y", "yes"):
         print("\nRunning in this window. Keep it open: while Squidbrake isn't running, your agents' actions are blocked.\n"
-              f"Start it again with: {_cli('start')}   (or in the background: {_cli('start --background')})\n")
+              f"Start it again with: {_cli('start')}   (or in the background: {_cli('start --background')})\n"
+              "Once it's running, quit and reopen your agents (Claude Code, Cursor, Codex, ...), then work as usual.\n")
         return False
     return True
 
@@ -368,9 +369,20 @@ def wants_background(kind: str) -> bool:
     yes = _ask(kind)
     if yes is not None:
         _save_choice(yes)
-    if not yes:
+    if yes is None:         # Ctrl-C or no answer (a no already said this)
         print(f"Running in this window. To run in the background later: {_cli('start --background')}\n")
     return bool(yes)
+
+
+def is_first_start(run_args: list[str]) -> bool:
+    """`squidbrake` typed in a terminal for the first time: the background question is about to be asked.
+    That's step 3 of the setup (see flow.py); every later start is just a start."""
+    if any(a in ("--foreground", "--background") for a in run_args) or not _interactive():
+        return False
+    if os.getenv("SQUIDBRAKE_BACKGROUND", "").strip():
+        return False
+    kind = backend()
+    return bool(kind) and _saved_choice() is None and not _installed(kind)
 
 
 def start(run_args: list[str]) -> int:
@@ -384,6 +396,9 @@ def start(run_args: list[str]) -> int:
             print("A background service isn't available here (Docker, or no systemd user session). "
                   "Running in this window.", file=sys.stderr)
         return _foreground(run_args)
+    if is_first_start(run_args):
+        import flow                            # the last of the three setup commands: say so (see flow.py)
+        flow.header(3)
     if explicit:
         _save_choice(True)
     elif not wants_background(kind):
@@ -391,7 +406,7 @@ def start(run_args: list[str]) -> int:
     port = _port(run_args)
     busy = _answering(port)
     # First start: make the keys here, where the person can see them (the service's output only goes to its log).
-    subprocess.call([sys.executable, str(SERVER), "init"], cwd=str(HERE))
+    subprocess.call([sys.executable, str(SERVER), "init", "--quiet"], cwd=str(HERE))
     first = not _installed(kind)
     try:
         log = {"launchd": _launchd_install, "systemd": _systemd_install, "windows": _win_install}[kind](run_args)
@@ -415,6 +430,11 @@ def start(run_args: list[str]) -> int:
         print(f"\n  Note: something was already answering on port {port} (probably Squidbrake started by hand).")
         print("  Close that one; the background service takes over on its own.")
     print("=" * 72 + "\n")
+    if first:
+        import flow
+        flow.next_step(["Setup complete. Last step: quit and reopen your agents (Claude Code, Cursor, Codex, ...),",
+                        "then work as usual.", "",
+                        "Check everything end to end:  " + flow.doctor_command()])
     if first and up and not os.getenv("SQUIDBRAKE_NO_BROWSER"):
         webbrowser.open(url)
     return 0

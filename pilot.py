@@ -1,7 +1,7 @@
 """
-Pilot programme: share usage COUNTS with the Squidbrake team, only after you join: with a code you were given, by
-saying yes to anonymous usage stats the first time you run `squidbrake` (telemetry.py), or by saying yes when
-`squidbrake connect all` asks (once, default no).
+Pilot programme: share usage COUNTS with the Squidbrake team: with a code you were given, or, for every other
+install, as the anonymous usage stats that start with the first `squidbrake` command run in a terminal
+(telemetry.py; they join the community code below).
 
     squidbrake pilot join CODE --server URL    start sharing (shows exactly what is sent, and asks first)
     squidbrake pilot status                    what is shared, where, and when it was last sent

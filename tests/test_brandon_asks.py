@@ -22,7 +22,8 @@ def test_connect_all_can_take_just_one_agent(monkeypatch):
     monkeypatch.setattr(connect, "claude_code", lambda a: done.append("claude-code"))
     monkeypatch.setattr(connect, "agents", lambda a: done.append(f"hook:{a.agent}"))
     monkeypatch.setattr(connect, "guard", lambda a: done.append(f"mcp:{a.agent}"))
-    monkeypatch.setattr(connect, "offer_counts", lambda: None)
+    monkeypatch.setattr(connect, "_first_keys", lambda url: None)
+    monkeypatch.setattr(connect, "_next_step", lambda url: None)
     connect.connect_all(Namespace(url="http://localhost:8080", key="gw_x", remove=False, yes=True, only=["cursor"]))
     assert done == ["hook:cursor", "mcp:cursor"]
     done.clear()

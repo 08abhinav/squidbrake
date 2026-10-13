@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
     only = args.only or ([os.environ["SQUIDBRAKE_AGENTS"]] if os.getenv("SQUIDBRAKE_AGENTS") else None)
     try:
-        connect.connect_all(argparse.Namespace(url=shown, key=None, remove=False, yes=True, only=only))
+        connect.connect_all(argparse.Namespace(url=shown, key=None, remove=False, yes=True, only=only, steps=False))
     except (Exception, SystemExit) as e:
         _say("X", f"Connecting the agents stopped: {e}")
         print(f"      Fix that, then run:  {server.CLI} connect all\n")

@@ -1,11 +1,9 @@
 """
 Anonymous usage stats: which `squidbrake` commands run, and counts of what the gateway checked, held and blocked.
-Only after you say yes: the first time you run `squidbrake` in a terminal it asks once (Enter means yes). Scripts,
-CI, `--yes` and the agent hooks are never asked, and send nothing until someone has said yes.
+They are always on. The first time you run `squidbrake` in a terminal it says so once (and asks, optionally, where
+you heard about Squidbrake). Scripts, CI, `--yes` and the agent hooks send nothing until that first run happened.
 
-    squidbrake telemetry status      what is sent, and whether it is on
-    squidbrake telemetry off         stop (or set SQUIDBRAKE_TELEMETRY=0, or DO_NOT_TRACK=1)
-    squidbrake telemetry on          start
+    squidbrake telemetry status      exactly what is sent
     squidbrake register EMAIL        tell the Squidbrake team who you are (optional; asks first)
 
 What is sent, once each time you run a command:
@@ -16,13 +14,12 @@ What is sent, once each time you run a command:
   - where you heard about Squidbrake, if you answered (one word from a list, e.g. "linkedin"), or the name of the
     link you installed from (SQUIDBRAKE_REF, e.g. "whatsapp")
 Never sent: commands an agent ran, file or folder names, file contents, prompts, rules, keys, the audit trail,
-names of people, your email (unless you type it: the first-run question offers to, after a yes and Enter skips,
-or `squidbrake register`).
+names of people, your email (unless you give it with `squidbrake register`).
 The agent hooks (`hook`, `agent-hook`, `shell-guard`, `proxy`) send nothing, so nothing slows a tool call down.
 
-The same yes also shares the gateway's usage counts with the Squidbrake team, exactly as a pilot does (see pilot.py
-for every field): how many actions were allowed, held and blocked per day, and for each one held or blocked, the
-program only (e.g. "rm"), the rule, what happened and its size as numbers. Never the command, files or prompts.
+The gateway's usage counts go to the Squidbrake team the same way, exactly as a pilot's do (see pilot.py for every
+field): how many actions were allowed, held and blocked per day, and for each one held or blocked, the program
+only (e.g. "rm"), the rule, what happened and its size as numbers. Never the command, files or prompts.
 """
 from __future__ import annotations
 
@@ -61,10 +58,11 @@ def ref_from_env() -> str | None:
 
 
 def _ask_source() -> str | None:
-    print("Optional: where did you hear about Squidbrake? It tells one small team where to spend its time.")
+    print("One optional question: where did you hear about Squidbrake?")
     for i, (_, label) in enumerate(SOURCES, 1):
         print(f"  {i}. {label}")
     answer = _ask("Number (Enter to skip): ")
+    print()
     if answer and answer.isdigit() and 1 <= int(answer) <= len(SOURCES):
         return SOURCES[int(answer) - 1][0]
     return None
@@ -120,8 +118,8 @@ def _share_counts(on: bool, version: str, ref: str | None = None) -> bool:
                 pilot.join(home, COMMUNITY_CODE, COMMUNITY_SERVER, True, version, ref=ref)
             elif not on and mine and mine.get("code") == COMMUNITY_CODE:
                 pilot.leave(home)
-        home.mkdir(parents=True, exist_ok=True)     # so `connect all` doesn't ask the same thing again
-        (home / "community-asked").write_text("answered in the first-run question (telemetry.py)\n", encoding="utf-8")
+        home.mkdir(parents=True, exist_ok=True)     # older versions' `connect all` asked about counts: it's settled
+        (home / "community-asked").write_text("said in the first-run notice (telemetry.py)\n", encoding="utf-8")
         return bool(pilot.load(home))
     except Exception:     # sharing counts must never break a command
         return False
@@ -146,29 +144,27 @@ def _ask(question: str) -> str | None:
         return None
 
 
-def _ask_once(cfg: dict, version: str) -> dict:
-    print("\nSquidbrake can send anonymous usage stats to its team:")
-    print("  - which squidbrake commands run, the version, OS and country")
-    print('  - counts of what it checked, held and blocked: the program only (e.g. "rm"), the rule, and sizes')
-    print("Never your commands, files, prompts, rules or keys. It shows one small team what to fix next.")
-    print("Turn it off any time: squidbrake telemetry off")
-    answer = _ask("Send anonymous usage stats? [Y/n] ")
-    cfg = {"id": cfg.get("id") or str(uuid.uuid4()), "enabled": answer is not None and answer.lower() in ("", "y", "yes"),
+NOTICE = """\
+Squidbrake sends anonymous usage counts to its team, so one small team can see what to fix next:
+  - which squidbrake commands run, the version, OS and country
+  - how many actions it allowed, held and blocked; for each one held or blocked, the program only
+    (e.g. "rm"), the rule, and sizes as numbers
+Never your commands, files, prompts, rules or keys. Exactly what is sent:  squidbrake telemetry status"""
+
+
+def _first_run(cfg: dict, version: str) -> dict:
+    """The first `squidbrake` command in a terminal: say once what is sent (it isn't a question), and ask,
+    optionally, where they heard about Squidbrake."""
+    print("\n" + NOTICE + "\n")
+    cfg = {"id": cfg.get("id") or str(uuid.uuid4()), "enabled": True,
            "asked": datetime.now(timezone.utc).date().isoformat()}
-    if cfg["enabled"]:
-        if ref := ref_from_env() or _ask_source():
-            cfg["ref"] = ref
-        email = _ask("Optional: your work email, if you'd like the team to reach you (Enter to skip): ")
-        if email and "@" in email:
-            cfg["email"] = email
-            if POSTHOG_KEY:
-                _send("$identify", cfg["id"], {"$set": {"email": email}}, wait=True)
+    if ref := ref_from_env() or _ask_source():
+        cfg["ref"] = ref
     _save(cfg)
-    cfg["counts_joined"] = _share_counts(cfg["enabled"], version, cfg.get("ref"))
-    if cfg["enabled"] and not cfg["counts_joined"]:
+    cfg["counts_joined"] = _share_counts(True, version, cfg.get("ref"))
+    if not cfg["counts_joined"]:
         cfg["counts_retry"] = _today()          # tried today: the next try is tomorrow (see maybe)
     _save(cfg)
-    print("Thanks. " + ("Stats are on." if cfg["enabled"] else "Nothing will be sent.") + "\n")
     return cfg
 
 
@@ -201,19 +197,19 @@ def _send(event: str, distinct_id: str, props: dict, wait: bool = False) -> None
 
 
 def maybe(argv: list[str], version: str) -> None:
-    """Called once per `squidbrake` command. Asks the first time in a terminal, sends only after a yes."""
+    """Called once per `squidbrake` command. Says what is sent the first time in a terminal, then sends."""
     command = argv[0] if argv and not argv[0].startswith("-") else "start"
     if command in QUIET or _switched_off():
         return
     cfg = load()
     if "enabled" not in cfg:
-        # not during `pilot join` either: the installer runs it, and two questions with opposite defaults (this one
-        # Yes, the pilot's No) would put a founder who presses Enter in the community pilot instead of theirs
+        # not during `pilot join` either: the installer runs it, and a founder with their own code must land in
+        # their pilot, not in the community one
         if command == "pilot" or not _interactive() or "--yes" in argv or any(a in ("-h", "--help") for a in argv):
             return
-        cfg = _ask_once(cfg, version)
+        cfg = _first_run(cfg, version)
     if cfg.get("enabled") and cfg.get("counts_joined") is False and cfg.get("counts_retry") != _today():
-        # said yes, but joining the counts failed (offline, server down): try again, once a day, until it works.
+        # joining the counts failed (offline, server down): try again, once a day, until it works.
         # Someone who later left (squidbrake pilot leave) has counts_joined True, so they're never joined again.
         cfg["counts_retry"] = _today()
         cfg["counts_joined"] = _share_counts(True, version, cfg.get("ref"))
@@ -257,21 +253,13 @@ def register(argv: list[str], version: str) -> int:
 def main(argv: list[str], version: str = "") -> int:
     cfg = load()
     action = argv[0] if argv else "status"
-    if action in ("on", "off"):
-        cfg.setdefault("id", str(uuid.uuid4()))
-        cfg["enabled"] = action == "on"
-        cfg["asked"] = cfg.get("asked") or datetime.now(timezone.utc).date().isoformat()
-        cfg["counts_joined"] = _share_counts(action == "on", version)
-        _save(cfg)
-        print("Anonymous usage stats are " + action + ".")
-        return 0
     if action != "status":
-        print("usage: squidbrake telemetry [status|on|off]")
+        print("usage: squidbrake telemetry status\n\n" + NOTICE)
         return 2
     if _switched_off():
-        state = "off (switched off by SQUIDBRAKE_TELEMETRY, DO_NOT_TRACK or CI)"
+        state = "off (CI, DO_NOT_TRACK or SQUIDBRAKE_TELEMETRY is set)"
     else:
-        state = {True: "on", False: "off"}.get(cfg.get("enabled"), "not asked yet (nothing is sent until you say yes)")
+        state = "on" if cfg.get("enabled") else "on (from the first squidbrake command you run in a terminal)"
     print(f"Anonymous usage stats: {state}")
     if cfg.get("email"):
         print(f"Registered email: {cfg['email']}")

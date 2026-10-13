@@ -632,9 +632,44 @@ def overview(request: Request):
                     "active_today": bool(daily[span[-1]]["events"]), "days_this_week": days_this_week,
                     "days_last_week": days_last_week})
     totals["paused"] = sum(p["paused"] for p in out)     # per pilot, incl. ones read from older gateways' catches
-    return {"span": span, "pilots": out, "week": totals, "latest_version": latest or None,
-            "active_pilots": sum(1 for p in out if p["stage"] == "active"),
-            "installs": sum(p["installs"] for p in out), "scorecard": scorecard(out, totals)}
+    # pilots and individual installs are read apart: `week` and `installs` stay the sum of both (older readers),
+    # the scorecard and `pilots_week` are pilots only, and `community` is the individual installs' own rollup
+    named = [p for p in out if not p["community"]]
+    pilots_week = {k: sum(p["week"][k] for p in named) for k in SUMS}
+    community = next((p for p in out if p["community"]), None)
+    return {"span": span, "pilots": out, "week": totals, "pilots_week": pilots_week, "latest_version": latest or None,
+            "active_pilots": sum(1 for p in named if p["stage"] == "active"),
+            "installs": sum(p["installs"] for p in out), "scorecard": scorecard(named, pilots_week),
+            "community": community_block(community, [i for i in installs if i["code"] == COMMUNITY_CODE], by_install, span, latest)}
+
+
+def community_block(entry: dict | None, mine: list[dict], by_install: dict, span: list[str], latest: str) -> dict:
+    """Individual installs (pip, stats on by default; telemetry.py), rolled up on their own: how many, how many
+    used it, and who they are as counts (version, OS, where they heard of it, agents). Never a name or an id."""
+    from collections import Counter
+    week = span[-7:]
+    active = [i for i in mine if not i["left_at"]]
+    actions = {i["install_id"]: sum(cnt.get("events", 0) for d, cnt in by_install.get(i["install_id"], {}).items() if d in week)
+               for i in active}
+    used = sorted(n for n in actions.values() if n)
+    family = lambda s: {"darwin": "macOS"}.get((s or "").split(" ")[0].lower(), (s or "").split(" ")[0] or "unknown")
+    tally = lambda f: sorted(Counter(f(i) for i in active).items(), key=lambda kv: (-kv[1], kv[0]))
+    connected = Counter(a for i in active for a in json.loads(i["connected"] or "[]"))
+    versions = [[v, n, bool(latest) and _version(v) < _version(latest)] for v, n in tally(lambda i: i["version"] or "unknown")]
+    zero = {k: 0 for k in SUMS}
+    e = entry or {}
+    return {"installs": len(active), "left": len(mine) - len(active),
+            "new_this_week": sum(1 for i in active if (i["joined_at"] or "")[:10] >= week[0]),
+            "reporting_this_week": sum(1 for i in active if (i["last_seen"] or "")[:10] >= week[0]),
+            "used_this_week": len(used), "median_actions": used[len(used) // 2] if used else 0,
+            "versions": versions, "os": tally(lambda i: family(i["os"])), "refs": tally(lambda i: i["ref"] or "not said"),
+            "connected": sorted(connected.items(), key=lambda kv: (-kv[1], kv[0])),
+            "outdated": any(v[2] for v in versions),
+            "week": e.get("week", zero), "daily": e.get("daily", [0] * len(span)), "trend": e.get("trend"),
+            "agents": e.get("agents", {}), "rules_hit": e.get("rules_hit", {}), "catches": e.get("catches", []),
+            "stopped": e.get("stopped", 0), "paused": e.get("paused", 0), "saved": e.get("saved", {}),
+            "rule_approvals": e.get("rule_approvals", []), "decide_median_s": e.get("decide_median_s"),
+            "total_events": e.get("total_events", 0)}
 
 
 def scorecard(pilots: list[dict], week: dict) -> dict:
@@ -738,9 +773,10 @@ def traction():
         installs = [dict(r) for r in c.execute("SELECT install_id, code, left_at, agents, connected, total_events "
                                                "FROM installs")]
         days = c.execute("SELECT install_id, day, counts FROM days").fetchall()
-        caught = [json.loads(r[0]) for r in c.execute("SELECT data FROM catches")]
+        raw_caught = c.execute("SELECT install_id, data FROM catches").fetchall()
         asks = [r[0] for r in c.execute("SELECT created_at FROM team_requests")]
     code_of = {i["install_id"]: i["code"] for i in installs}
+    caught = [json.loads(d) for iid, d in raw_caught if code_of.get(iid) != COMMUNITY_CODE]   # pilots only, like the rest
     events_by: dict[str, dict] = {}                 # pilot code -> {day: actions}
     for iid, day, counts in days:
         n = json.loads(counts).get("events", 0)

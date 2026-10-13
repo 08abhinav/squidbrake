@@ -4211,10 +4211,12 @@ def _cli_keys(_) -> int:
     return 0
 
 
-def _cli_init(_) -> int:
+def _cli_init(args) -> int:
     created = keystore.ensure_initialized()
     if created:
         print_banner(None, created)
+    elif getattr(args, "quiet", False):      # `squidbrake` runs this before installing the service: nothing to say
+        pass
     elif keystore.from_env or keystore.disabled:
         print("Keys come from your settings (GATEWAY_API_KEYS / GATEWAY_AUTH); nothing to create.")
     else:
@@ -4296,7 +4298,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--port", type=int, default=int(os.getenv("PORT", "8080")))
     r.add_argument("--workers", type=int, default=int(os.getenv("WORKERS", "1")))
     r.add_argument("--no-browser", action="store_true", help="don't open the dashboard on first start")
-    sub.add_parser("init", help="create the first keys (happens automatically on first start)")
+    sub.add_parser("init", help="create the first keys (happens automatically on first start)").add_argument(
+        "--quiet", action="store_true", help="say nothing if they exist already")
     rs = sub.add_parser("resume", help="turn an emergency stop off (all agents, one agent, or one conversation)")
     rs.add_argument("--agent")
     rs.add_argument("--session")

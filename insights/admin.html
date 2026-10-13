@@ -280,6 +280,19 @@ th { background:color-mix(in srgb, var(--line-2) 60%, transparent); }
 .ptable svg { display:block; width:96px; height:24px; }
 .zero { color:var(--faint); }
 
+/* individual installs: who they are, as small breakdown bars */
+.bk-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:16px 24px; }
+.bk h4 { margin:0 0 8px; font-size:11.5px; font-weight:600; color:var(--muted); letter-spacing:.05em; text-transform:uppercase; }
+.bk .rows { display:grid; grid-template-columns:minmax(0, 1fr) 36px; gap:1px 10px; font-size:13px; align-items:center; }
+.bk .l { color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.bk .l.old { color:var(--warn); }
+.bk .c { text-align:right; font-variant-numeric:tabular-nums; font-weight:600; }
+.bk .bar { grid-column:1 / -1; height:5px; border-radius:3px; background:var(--line-2); overflow:hidden; margin-bottom:7px; }
+.bk .bar i { display:block; height:100%; background:var(--tone, var(--link)); border-radius:3px; }
+.ind-head { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; margin:0 0 14px; }
+.ind-head h1 { font:500 30px/1.1 var(--serif); letter-spacing:-.015em; margin:0; }
+.ind-head .sub { font-size:14px; }
+
 /* where people come from: a little funnel per channel */
 .src-bar { display:flex; height:6px; border-radius:3px; overflow:hidden; background:var(--line-2); width:160px; margin-top:7px; }
 .src-bar i { display:block; height:100%; }
@@ -392,11 +405,11 @@ async function load() {
   try { [d, me, asks, inv, fails, src] = await Promise.all([api("/v1/admin/overview"), api("/v1/admin/me"), api("/v1/admin/team-requests"),
                                                 api("/v1/admin/traction"), api("/v1/admin/install-reports"), api("/v1/admin/sources")]); }
   catch (e) { if (e.message !== "unauthorized") app.innerHTML = `<main><p class="err">${esc(e.message)}</p></main>`; return; }
-  const w = d.week;
+  const w = d.week, named = d.pilots.filter((p) => !p.community);   // the community row has its own section
   d_latest = d.latest_version || "";
   app.innerHTML = `
     <div class="top"><div class="in"><div class="brand"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><path fill="currentColor" d="M16 30V21.5C16 12.4 23.2 5 32 5C40.8 5 48 12.4 48 21.5V30Z"/><g fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round"><path d="M23 34V48.2C23 51.4 21.7 53.9 19.6 55.8"/><path d="M32 34V44.6"/><path d="M41 34V48.2C41 51.4 42.3 53.9 44.4 55.8"/></g><circle fill="currentColor" cx="32" cy="52.6" r="2.9"/><rect fill="#F2622E" x="11" y="24.5" width="42" height="11" rx="5.5"/><circle fill="#2FD574" cx="41.2" cy="30" r="2.5"/></svg><span>Squid<b>brake</b></span> <small>Pilots</small></div>
-      <nav><a href="#week">This week</a><a href="#stopped">Stopped</a><a href="#traction">Traction</a><a href="#pilots">Pilots</a><a href="#sources">Sources</a><a href="#requests">Requests</a><a href="#fails">Failed installs</a><a href="#new">New pilot</a></nav>
+      <nav><a href="#week">This week</a><a href="#individuals">Individuals</a><a href="#stopped">Stopped</a><a href="#traction">Traction</a><a href="#pilots">Pilots</a><a href="#sources">Sources</a><a href="#requests">Requests</a><a href="#fails">Failed installs</a><a href="#new">New pilot</a></nav>
       <span class="spacer"></span>
       <button class="btn ghost" id="refresh">Refresh</button><button class="btn ghost" id="pw">${me.has_password ? "Password" : "Set password"}</button>
       <button class="btn ghost" id="logout">Sign out</button></div></div>
@@ -404,12 +417,13 @@ async function load() {
     ${me.has_password ? "" : `<div class="notice"><span><b>Set your own password</b> so you don't have to sign in with the server key.</span>
       <button class="btn" id="pw2" style="margin-left:auto">Set password</button></div>`}
     ${overview(d, inv, asks)}
+    ${communityPanel(d)}
     ${stoppedPanel(d.pilots)}
     ${tractionPanel(inv)}
-    <section id="pilots"><div class="sec-h"><h2>Pilot details</h2><span class="sub">Hosted dashboards report every 2 minutes</span>
+    <section id="pilots"><div class="sec-h"><h2>Pilot details</h2><span class="sub">Hosted dashboards report every 2 minutes; individual installs are above</span>
         <div class="act"><a class="btn" href="#new">New pilot</a></div></div>
-      ${d.pilots.length ? `<div class="table-wrap"><table><thead><tr><th>Company</th><th>Status</th><th>Last 14 days</th>
-        <th>Last 7 days</th><th>Agents</th><th>What fired</th><th></th></tr></thead><tbody>${d.pilots.map(row).join("")}</tbody></table></div>`
+      ${named.length ? `<div class="table-wrap"><table><thead><tr><th>Company</th><th>Status</th><th>Last 14 days</th>
+        <th>Last 7 days</th><th>Agents</th><th>What fired</th><th></th></tr></thead><tbody>${named.map(row).join("")}</tbody></table></div>`
         : `<div class="surface empty">No pilots yet. Create a link below and send it to a founder.</div>`}
     </section>
     ${teamPanel(asks)}
@@ -509,17 +523,18 @@ const hue = (t) => [...String(t)].reduce((h, ch) => (h * 31 + ch.charCodeAt(0)) 
 const initials = (t) => String(t).replace(/[^A-Za-z0-9 ]/g, "").split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join("").toUpperCase() || "?";
 
 function overview(d, inv, asks) {
-  const sc = d.scorecard, wk = d.week, pilots = d.pilots.filter((p) => !p.community);   // pip users who opted in aren't a pilot
+  // pilots only: individual pip installs have their own section (communityPanel), so nothing here mixes the two
+  const sc = d.scorecard, wk = d.pilots_week || d.week, pilots = d.pilots.filter((p) => !p.community);
   const active = pilots.filter((p) => p.days_this_week).length, active3 = pilots.filter((p) => p.days_this_week >= 3).length;
   const first = pilots.map((p) => p.created_at).filter(Boolean).sort()[0];
   const weekNo = first ? Math.max(1, Math.floor((Date.now() - new Date(first)) / (7 * 864e5)) + 1) : 1;
-  const catches = d.pilots.flatMap((p) => (p.catches || []).map((x) => ({ ...x, company: p.community ? "a pip user" : p.company })))
+  const catches = pilots.flatMap((p) => (p.catches || []).map((x) => ({ ...x, company: p.company })))
     .filter((x) => STOPPED.includes(x.outcome) && !PAUSED_RULES.includes(x.rule)).sort((a, b) => (b.t || "").localeCompare(a.t || ""));
   const decided = wk.approved + wk.rejected + wk.timed_out;
   const plural = (n, one, many) => `${Number(n).toLocaleString()} ${n === 1 ? one : many}`;
 
   // the 14-day chart: every pilot's actions per day
-  const daily = (d.span || []).map((_, i) => d.pilots.reduce((t, p) => t + ((p.daily || [])[i] || 0), 0));
+  const daily = (d.span || []).map((_, i) => pilots.reduce((t, p) => t + ((p.daily || [])[i] || 0), 0));
   const thisWk = daily.slice(-7).reduce((a, b) => a + b, 0), lastWk = daily.slice(0, 7).reduce((a, b) => a + b, 0);
   const wow = lastWk ? Math.round(100 * (thisWk - lastWk) / lastWk) : null;
   const fmtDay = (iso) => iso ? new Date(iso + "T00:00:00").toLocaleDateString(undefined, { day: "numeric", month: "short" }) : "";
@@ -615,6 +630,68 @@ function overview(d, inv, asks) {
       ${pilots.length ? `<div style="overflow-x:auto"><table class="ptable"><thead><tr><th>Pilot</th><th>Status</th><th>14 days</th><th class="n">Actions</th><th class="n">Held</th>
         <th class="n">Approved</th><th class="n">Rejected</th><th class="n">Timed out</th><th class="n">Emergency stops</th><th>Version</th><th>Agents (actions)</th></tr></thead>
         <tbody>${sorted.map(prow).join("")}</tbody></table></div>` : `<div class="sub">No pilots yet. Create one below.</div>`}</div>
+  </section>`;
+}
+
+// Individual installs: people who pip-installed on their own and share anonymous counts (telemetry.py). Not pilots:
+// no names, no links, no follow-ups. Rolled up on their own here, so the pilot numbers above are pilots only.
+function communityPanel(d) {
+  const c = d.community;
+  if (!c) return "";
+  const wk = c.week || {}, daily = c.daily || [], span = d.span || [];
+  const thisWk = daily.slice(-7).reduce((a, b) => a + b, 0), lastWk = daily.slice(0, 7).reduce((a, b) => a + b, 0);
+  const wow = lastWk ? Math.round(100 * (thisWk - lastWk) / lastWk) : null;
+  const decided = (wk.approved || 0) + (wk.rejected || 0), rate = decided ? Math.round(100 * wk.approved / decided) : null;
+  const heldShare = wk.events ? Math.round(1000 * wk.held / wk.events) / 10 : 0;
+  const fmtDay = (iso) => iso ? new Date(iso + "T00:00:00").toLocaleDateString(undefined, { day: "numeric", month: "short" }) : "";
+  const kpi = (cls, tone, icon, k, v, n, extra = "") => `<div class="kpi ${cls}" style="--tone:${tone}"><div class="k"><i>${icon}</i>${k}</div>
+    <div class="v">${v}</div>${n ? `<div class="n">${n}</div>` : ""}${extra}</div>`;
+  const kpis = [
+    kpi("", "var(--link)", "⌂", "Installs sharing stats", c.installs, [c.new_this_week ? `${c.new_this_week} new this week` : "none new this week",
+        c.left ? `${c.left} left` : ""].filter(Boolean).join(" · ")),
+    kpi("", "var(--ok)", "●", "Used this week", `${c.used_this_week}<small>of ${c.installs}</small>`,
+        [`${c.reporting_this_week} reported in`, c.median_actions ? `median ${c.median_actions.toLocaleString()} actions each` : ""].filter(Boolean).join(" · ")),
+    kpi("", "var(--c-approved)", "↯", "Agent actions", (wk.events || 0).toLocaleString(), `this week ${deltaChip(wow)}`, spark(daily)),
+    kpi("", "var(--warn)", "⏸", "Held for a person", (wk.held || 0).toLocaleString(),
+        c.decide_median_s !== null && c.decide_median_s !== undefined ? `${heldShare}% of actions · decided in ${fmtSecs(c.decide_median_s)}` : `${heldShare}% of actions`,
+        `<div class="meter"><i style="width:${Math.min(100, heldShare * 5)}%"></i></div>`),
+    kpi(c.stopped ? "hot" : "", "var(--accent)", "✋", "Real catches", c.stopped,
+        [savedText(c.saved) ? savedText(c.saved) + " saved" : "rejected or blocked", c.paused ? `${c.paused} emergency-stop pauses not counted` : ""].filter(Boolean).join(" · ")),
+    `<div class="kpi${rate > 90 ? " warn" : ""}" style="--tone:${rate > 90 ? "var(--warn)" : "var(--ok)"}"><div class="k"><i>✓</i>Holds approved</div>
+      ${gauge(rate)}<div class="gauge-v">${rate === null ? "–" : rate + "%"}</div>
+      <div class="n">${rate > 90 ? "Over the 90% mark: rules hold routine work" : "The mark is 90%: above it, rules hold routine work"}</div></div>`,
+  ].join("");
+  const bk = (title, pairs, tone = "var(--link)", old = () => false) => {
+    const total = Math.max(1, ...pairs.map(([, n]) => n));
+    return `<div class="bk" style="--tone:${tone}"><h4>${title}</h4>${pairs.length ? `<div class="rows">${pairs.slice(0, 6).map(([k, n]) =>
+      `<span class="l${old(k) ? " old" : ""}" title="${esc(k)}">${esc(k)}</span><span class="c">${Number(n).toLocaleString()}</span>
+       <span class="bar"><i style="width:${Math.round(100 * n / total)}%"></i></span>`).join("")}</div>` : `<div class="sub">nothing yet</div>`}</div>`;
+  };
+  const sortedMap = (m) => Object.entries(m || {}).sort((a, b) => b[1] - a[1]);
+  const oldVersions = new Set((c.versions || []).filter((x) => x[2]).map((x) => "v" + x[0]));   // the server compares them
+  const who = `<div class="bk-grid">
+      ${bk("Where they heard of it", c.refs || [])}
+      ${bk("Computer", c.os || [])}
+      ${bk("Version", (c.versions || []).map(([v, n]) => ["v" + v, n]), "var(--link)", (v) => oldVersions.has(v))}
+      ${bk("Agents connected", c.connected || [], "var(--ok)")}
+      ${bk("Agents, by actions", sortedMap(c.agents), "var(--c-approved)")}
+      ${bk("Rules that fired", sortedMap(c.rules_hit), "var(--accent)")}
+    </div>`;
+  const catches = c.catches || [];
+  return `<section id="individuals">
+    <div class="sec-h"><h2>Individual installs</h2><span class="sub">pip installs that share anonymous counts: not pilots, no names, no links. Reported every 6 hours.</span></div>
+    <div class="ind-head"><h1>${c.installs ? `${c.used_this_week} of ${c.installs} individual installs used Squidbrake this week` : "No individual install shares stats yet"}</h1>
+      ${c.installs ? `<span class="sub">${(wk.events || 0).toLocaleString()} actions went through them, ${(wk.held || 0).toLocaleString()} held, ${c.stopped} risky ${c.stopped === 1 ? "action" : "actions"} stopped</span>` : ""}</div>
+    <div class="kpis">${kpis}</div>
+    <div class="ov-row">
+      <div class="chart-card"><div class="top-row"><div><div class="k">Agent actions, last 14 days, every individual install</div><div class="big">${thisWk.toLocaleString()}</div>
+          <div class="k" style="margin-top:4px">this week${lastWk ? ` · ${lastWk.toLocaleString()} the week before` : ""}</div></div>${deltaChip(wow)}</div>
+        ${areaChart(daily)}<div class="axis"><span>${fmtDay(span[0])}</span><span>${fmtDay(span[7])}</span><span>today</span></div></div>
+      <div class="ov-card"><h3>Who they are</h3><span class="sub">Counts of installs (version, computer, where from) and of actions (agents, rules).${c.outdated ? ` <b style="color:var(--warn)">Some run an old version.</b>` : ""}</span>${who}</div>
+    </div>
+    ${catches.length ? `<div class="ov-card" style="margin-top:16px"><h3>What it held or blocked</h3><span class="sub">The program only, never its arguments, files or prompts; sizes as numbers. Newest first.</span>
+      <div style="overflow-x:auto"><table class="inner" style="width:100%"><thead><tr><th>When</th><th>Agent</th><th>Action</th><th>Why</th><th>Outcome</th><th>Would have changed</th><th>Decided in</th></tr></thead>
+      <tbody>${catches.map(catchRow).join("")}</tbody></table></div></div>` : ""}
   </section>`;
 }
 
@@ -730,13 +807,16 @@ const trend = (v) => v === null || v === undefined ? "" : `<small class="${v >= 
 
 // What to send a cofounder every week: usage, not output
 function weeklyReport(d) {
-  const s = d.scorecard, w = d.week, day = new Date().toISOString().slice(0, 10);
+  const s = d.scorecard, w = d.pilots_week || d.week, c = d.community, day = new Date().toISOString().slice(0, 10);
+  const pilots = d.pilots.filter((p) => !p.community);
   const lines = [`Squidbrake pilots, week to ${day}`,
-    `Active today: ${s.active_today} · this week: ${s.active_this_week} · 3+ days this week: ${s.active_3_plus_days} (of ${d.pilots.length} pilots, ${d.installs} installs)`,
+    `Active today: ${s.active_today} · this week: ${s.active_this_week} · 3+ days this week: ${s.active_3_plus_days} (of ${pilots.length} pilots, ${pilots.reduce((t, p) => t + p.installs, 0)} installs)`,
     `Back from last week: ${s.retained} of ${s.active_last_week}`,
     `Actions: ${w.events} · held for a person: ${w.held} (approved ${w.approved}, rejected ${w.rejected}) · blocked by a rule: ${w.blocked}${w.paused ? ` · paused by emergency stop: ${w.paused}` : ""}`,
     `Holds approved: ${s.approve_rate === null ? "none decided yet" : s.approve_rate + "%"}`, "", "Per pilot:"];
-  for (const p of d.pilots) lines.push(`- ${p.company}: active ${p.days_this_week}/7 days, ${p.week.events} actions, ${p.week.held} held, ${p.week.blocked} blocked${p.paused ? `, ${p.paused} paused by emergency stop` : ""} (${p.stage}${p.outdated ? ", outdated version" : ""})`);
+  for (const p of pilots) lines.push(`- ${p.company}: active ${p.days_this_week}/7 days, ${p.week.events} actions, ${p.week.held} held, ${p.week.blocked} blocked${p.paused ? `, ${p.paused} paused by emergency stop` : ""} (${p.stage}${p.outdated ? ", outdated version" : ""})`);
+  if (c) lines.push("", `Individual installs (pip, not pilots): ${c.installs} sharing stats (${c.new_this_week} new this week), ${c.used_this_week} used this week, ` +
+    `${c.week.events} actions, ${c.week.held} held, ${c.week.blocked} blocked, ${c.stopped} risky actions stopped`);
   return lines.join("\n");
 }
 
@@ -800,7 +880,7 @@ function consequence(x) {
 // Every pilot's held or blocked actions in one list, newest first: what the agent tried, why it stopped, what it would have changed
 const STOPPED = ["rejected", "blocked"];
 function stoppedPanel(pilots) {
-  const all = pilots.flatMap((p) => (p.catches || []).map((x) => ({ ...x, company: p.company })))
+  const all = pilots.flatMap((p) => (p.catches || []).map((x) => ({ ...x, company: p.community ? "Individual install" : p.company })))
     .sort((a, b) => (b.t || "").localeCompare(a.t || ""));
   const stopped = all.filter((x) => STOPPED.includes(x.outcome));
   const saved = {};

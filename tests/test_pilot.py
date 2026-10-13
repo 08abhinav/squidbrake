@@ -155,27 +155,58 @@ def test_hosted_pilot_lifecycle(insights):
     assert all(p["code"] != code for p in insights.get("/v1/admin/overview", headers=admin).json()["pilots"])
 
 
-def test_connect_all_offers_counts_once_default_no(tmp_path, monkeypatch, capsys):
-    """Installs that aren't pilots can share counts, but only if they say yes when connect all asks: once,
-    default no, never in scripts, and never again after a no."""
+def test_individual_installs_are_rolled_up_apart_from_the_pilots(insights, monkeypatch):
+    """pip installs (the community code) get their own block in the overview: how many, how many used it, and who
+    they are as counts. The pilot numbers (pilots_week, scorecard) no longer include them."""
+    import app as insights_app
+    from datetime import datetime, timezone
+    monkeypatch.setattr(insights_app, "oss_numbers", lambda: {"latest_version": "0.9.0"})
+    admin = {"X-Admin-Key": os.environ["INSIGHTS_ADMIN_KEY"]}
+    code, today = insights_app.COMMUNITY_CODE, datetime.now(timezone.utc).date().isoformat()
+    pilot_code = insights.post("/v1/admin/pilots", headers=admin, json={"company": "Named Co"}).json()["code"]
+    pid, mac, win = "e" * 32, "f" * 32, "a" * 31 + "b"
+    insights.post("/v1/pilot/join", json={"code": pilot_code, "install_id": pid, "version": "0.9.0", "os": "Linux 6.1"})
+    insights.post("/v1/ping", json={"code": pilot_code, "install_id": pid, "usage": {"days": {today: {"events": 1000, "held": 10}}}})
+    insights.post("/v1/pilot/join", json={"code": code, "install_id": mac, "version": "0.9.0", "os": "Darwin 22.6.0", "ref": "friend"})
+    insights.post("/v1/pilot/join", json={"code": code, "install_id": win, "version": "0.8.0", "os": "Windows 11"})
+    insights.post("/v1/ping", json={"code": code, "install_id": mac, "usage": {
+        "version": "0.9.0", "os": "Darwin 22.6.0", "connected": ["claude-code", "cursor"],
+        "days": {today: {"events": 30, "held": 3, "approved": 2, "rejected": 1, "blocked": 1}},
+        "catches": [{"t": today + "T09:00", "program": "git", "rule": "command:irreversible", "outcome": "rejected", "decide_s": 20}]}})
+
+    d = insights.get("/v1/admin/overview", headers=admin).json()
+    c = d["community"]
+    assert c["installs"] >= 2 and c["used_this_week"] >= 1 and c["new_this_week"] >= 2
+    assert dict((k, n) for k, n, *_ in c["versions"])["0.8.0"] >= 1 and c["outdated"] is True
+    assert any(v[0] == "0.8.0" and v[2] for v in c["versions"]) and not any(v[0] == "0.9.0" and v[2] for v in c["versions"])
+    assert dict(c["os"])["macOS"] >= 1 and dict(c["os"])["Windows"] >= 1
+    assert dict(c["refs"])["friend"] >= 1 and dict(c["refs"]).get("not said", 0) >= 1
+    assert dict(c["connected"]) == {"claude-code": 1, "cursor": 1}
+    assert c["week"]["events"] >= 30 and c["stopped"] >= 1 and c["catches"][0]["program"] == "git"
+    assert c["median_actions"] >= 1 and "install_id" not in json.dumps(c)
+    # the pilots' side doesn't include them, and the totals still do
+    named = [p for p in d["pilots"] if not p["community"]]
+    assert d["pilots_week"]["events"] == sum(p["week"]["events"] for p in named) >= 1000
+    assert d["week"]["events"] == d["pilots_week"]["events"] + c["week"]["events"]
+    assert d["scorecard"]["actions"] == d["pilots_week"]["events"]
+    assert d["active_pilots"] == sum(1 for p in named if p["stage"] == "active")
+    assert "Individual installs" in insights.get("/admin").text
+
+
+def test_connect_all_never_asks_about_counts(tmp_path, monkeypatch):
+    """Counts aren't a question any more (telemetry.py says once what is sent): connect all, with or without
+    --yes, never prompts for them and never joins a pilot by itself."""
+    from argparse import Namespace
     import connect
     import server
     monkeypatch.setattr(server, "PILOT_DIR", tmp_path)
-    joined = []
-    monkeypatch.setattr(pilot, "_post", lambda srv, path, body: joined.append((srv, body["code"])) or {"company": "Community"})
-
-    monkeypatch.setattr("builtins.input", lambda prompt="": "")                 # just Enter: no
-    connect.offer_counts()
-    assert joined == [] and pilot.load(tmp_path) is None and (tmp_path / "community-asked").exists()
-    assert "Never sent" in capsys.readouterr().out                             # it says what would be sent first
-
-    monkeypatch.setattr("builtins.input", lambda prompt="": pytest.fail("asked twice"))
-    connect.offer_counts()                                                     # a no is remembered
-
-    (tmp_path / "community-asked").unlink()
-    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
-    connect.offer_counts()
-    assert joined == [(connect.COMMUNITY_SERVER, connect.COMMUNITY_CODE)] and pilot.load(tmp_path)["code"] == connect.COMMUNITY_CODE
+    monkeypatch.setattr(pilot, "_post", lambda srv, path, body: pytest.fail("joined a pilot from connect all"))
+    monkeypatch.setattr("builtins.input", lambda prompt="": pytest.fail("asked about counts"))
+    for f in ("claude_code", "agents", "guard", "_next_step"):
+        monkeypatch.setattr(connect, f, lambda *a, **k: None)
+    monkeypatch.setattr(connect, "_first_keys", lambda url: None)
+    connect.connect_all(Namespace(url="http://localhost:8080", key="gw_x", remove=False, yes=True, only=None))
+    assert pilot.load(tmp_path) is None
 
 
 def test_pilot_server_must_be_https_or_internal(tmp_path):
