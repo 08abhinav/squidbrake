@@ -259,7 +259,8 @@ def main(argv: list[str], version: str = "") -> int:
     if _switched_off():
         state = "off (CI, DO_NOT_TRACK or SQUIDBRAKE_TELEMETRY is set)"
     else:
-        state = "on" if cfg.get("enabled") else "on (from the first squidbrake command you run in a terminal)"
+        state = {True: "on", False: "off (you said no when an earlier version asked; that is kept)"}.get(
+            cfg.get("enabled"), "on (from the first squidbrake command you run in a terminal)")
     print(f"Anonymous usage stats: {state}")
     if cfg.get("email"):
         print(f"Registered email: {cfg['email']}")

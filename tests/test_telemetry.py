@@ -174,3 +174,12 @@ def test_a_join_that_failed_is_retried_once_a_day_and_never_after_leaving(sent, 
     n = len(calls)
     telemetry.maybe(["doctor"], "1")
     assert pilot.load(tmp_path / "data") is None and "/v1/pilot/join" not in calls[n:]
+
+
+def test_status_tells_an_earlier_no_apart(sent, monkeypatch, capsys):
+    """Someone who said no to an older version keeps sending nothing, and status says so instead of "on"."""
+    telemetry._save({"id": "x", "enabled": False, "asked": "2026-10-01"})
+    telemetry.maybe(["doctor"], "1")
+    assert sent == []
+    telemetry.main(["status"], "1")
+    assert "off (you said no" in capsys.readouterr().out
